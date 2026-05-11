@@ -1,0 +1,69 @@
+[project]
+name = "SEMambaXLinOSS"
+dynamic = ["version"]
+description = "Speech Enhancement with Mamba and LinOSS"
+readme = "README.md"
+
+requires-python = "==3.12.*"
+dependencies = [
+    "pesq>=0.0.4",
+    "argparse>=1.4.0",
+    "pyyaml>=6.0.3",
+    "soundfile>=0.13.1",
+    "librosa>=0.11.0",
+    "packaging>=26.2",
+    "einops>=0.8.2",
+    "torch==2.2.0",
+    "torchaudio>=2.11.0",
+    "torchcodec>=0.7.0",
+    "dataset[audio]>=2.0.0",
+    "pip>=26.1",
+    "setuptools==70.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4.3.0",
+    "ruff>=0.12.11",
+    "pandas>=2.3.2",
+    "ipykernel>=6.30.1",
+    "pytest>=8.3.3",
+    "tensorboard>=2.20.0"
+]
+
+[project.urls]
+Homepage = "https://camail.org/linax/"
+Discord = "https://discord.gg/VazrGCxeT7"
+Repository = "https://github.com/camail-official/linax"
+
+[build-system]
+requires = ["hatchling>=1.27.0", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { local_scheme = "no-local-version", version_scheme = "only-version" }
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/linax"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["C", "E", "F", "I", "W", "D", "N"]
+ignore = ["E741", "W605", "C408", "E402", "F722", "N806", "N803", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
