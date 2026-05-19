@@ -330,8 +330,8 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='SEMamba_advanced')
-    parser.add_argument('--config', default='recipes/SEMamba_advanced/SEMamba_advanced.yaml')
+    parser.add_argument('--exp_name', default='Custom')
+    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/Custom/SEMamba_advanced.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
