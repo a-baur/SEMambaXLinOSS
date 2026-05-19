@@ -2,7 +2,7 @@
 set -e
 
 # 1. Clear stale artifacts
-rm -rf mamba_install/build
+rm -rf mamba-1_2_0_post1/build
 rm -f uv.lock
 
 # 2. Create the virtual environment explicitly
