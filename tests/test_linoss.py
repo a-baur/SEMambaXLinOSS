@@ -141,6 +141,92 @@ def test_parameter_shapes():
     assert m.D.shape == (in_features,)
 
 
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _copy_model_to(model: LinOSS, device: torch.device, use_triton: bool) -> LinOSS:
+    """Build a fresh LinOSS with the same config but on `device` and copy params."""
+    twin = LinOSS(
+        in_features=model.in_features,
+        state_dim=model.state_dim,
+        discretization=model.discretization,
+        damping=model.damping,
+        use_triton=use_triton,
+    ).to(device)
+    with torch.no_grad():
+        for (_, p_src), (_, p_dst) in zip(model.named_parameters(), twin.named_parameters()):
+            p_dst.copy_(p_src.to(device))
+    return twin
+
+
+@cuda_only
+@pytest.mark.parametrize("discretization,damping", VARIANTS)
+def test_triton_forward_matches_reference(discretization, damping):
+    cpu_model = _make(in_features=4, state_dim=16, discretization=discretization, damping=damping)
+    triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
+    ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
+
+    torch.manual_seed(123)
+    x = torch.randn(3, 17, 4, device="cuda")
+
+    with torch.no_grad():
+        y_ref = ref_model(x)
+        y_triton = triton_model(x)
+
+    assert y_triton.shape == y_ref.shape
+    assert torch.allclose(y_triton, y_ref, atol=1e-5, rtol=1e-5), (
+        f"max abs diff: {(y_triton - y_ref).abs().max().item()}"
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("discretization,damping", VARIANTS)
+def test_triton_backward_matches_reference(discretization, damping):
+    cpu_model = _make(in_features=4, state_dim=16, discretization=discretization, damping=damping)
+    triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
+    ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
+
+    torch.manual_seed(7)
+    x = torch.randn(2, 13, 4, device="cuda")
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    x_tri = x.detach().clone().requires_grad_(True)
+
+    ref_model(x_ref).sum().backward()
+    triton_model(x_tri).sum().backward()
+
+    assert torch.allclose(x_tri.grad, x_ref.grad, atol=1e-4, rtol=1e-4), (
+        f"x.grad max abs diff: {(x_tri.grad - x_ref.grad).abs().max().item()}"
+    )
+
+    ref_params = dict(ref_model.named_parameters())
+    for name, p in triton_model.named_parameters():
+        ref_grad = ref_params[name].grad
+        assert p.grad is not None, f"no grad for {name}"
+        assert ref_grad is not None, f"no ref grad for {name}"
+        max_diff = (p.grad - ref_grad).abs().max().item()
+        assert torch.allclose(p.grad, ref_grad, atol=1e-4, rtol=1e-4), (
+            f"{name} grad mismatch, max abs diff: {max_diff}"
+        )
+
+
+@cuda_only
+@pytest.mark.parametrize("discretization,damping", VARIANTS)
+def test_triton_causality(discretization, damping):
+    cpu_model = _make(in_features=4, state_dim=16, discretization=discretization, damping=damping)
+    model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True).eval()
+
+    x = torch.randn(1, 12, 4, device="cuda")
+    t_perturb = 6
+    with torch.no_grad():
+        y_ref = model(x)
+        x_pert = x.clone()
+        x_pert[:, t_perturb:] += torch.randn_like(x_pert[:, t_perturb:])
+        y_pert = model(x_pert)
+
+    assert torch.allclose(y_ref[:, :t_perturb], y_pert[:, :t_perturb], atol=1e-5)
+
+
 def test_map_theta_to_A_matches_formula():
     # Sanity check the closed-form inversion: feed thetas in (0, pi/2) and (pi/2, pi),
     # confirm A_diag is finite and uses the correct branch.

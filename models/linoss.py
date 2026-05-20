@@ -35,6 +35,7 @@ class LinOSS(nn.Module):
         damping: bool = True,
         r_min: float = 0.9,
         theta_max: float = math.pi,
+        use_triton: bool = False,
     ):
         super().__init__()
         if discretization == "IM" and damping:
@@ -48,6 +49,7 @@ class LinOSS(nn.Module):
         self.state_dim = state_dim
         self.discretization = discretization
         self.damping = damping
+        self.use_triton = use_triton
 
         self.steps = nn.Parameter(torch.randn(state_dim) * 0.5)
 
@@ -83,7 +85,7 @@ class LinOSS(nn.Module):
 
         if self.discretization == "IM":
             A_diag = torch.relu(self.A_diag)
-            ys = _apply_linoss_im(A_diag, B_complex, x, steps)
+            ys = _apply_linoss_im(A_diag, B_complex, x, steps, use_triton=self.use_triton)
         else:  # IMEX
             if self.damping:
                 G_diag = torch.relu(self.G_diag)
@@ -95,10 +97,14 @@ class LinOSS(nn.Module):
                     + torch.relu(self.A_diag - A_low)
                     - torch.relu(self.A_diag - A_high)
                 )
-                ys = _apply_damped_linoss_imex(A_diag, G_diag, B_complex, x, steps)
+                ys = _apply_damped_linoss_imex(
+                    A_diag, G_diag, B_complex, x, steps, use_triton=self.use_triton
+                )
             else:
                 A_diag = torch.relu(self.A_diag)
-                ys = _apply_linoss_imex(A_diag, B_complex, x, steps)
+                ys = _apply_linoss_imex(
+                    A_diag, B_complex, x, steps, use_triton=self.use_triton
+                )
 
         # Cy + Du
         Cy = torch.einsum("fn,btn->btf", C_complex, ys).real
@@ -139,10 +145,15 @@ def _linoss_recurrence(
     M_22: torch.Tensor,
     F1: torch.Tensor,
     F2: torch.Tensor,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     # State evolves as
     #   [y1; y2]_t = [[M_11, M_12], [M_21, M_22]] [y1; y2]_{t-1} + [F1; F2]_t
     # with y_0 = 0. Returns the y2 trajectory.
+    if use_triton:
+        from models.linoss_triton import linoss_scan_triton
+        return linoss_scan_triton(M_11, M_12, M_21, M_22, F1, F2)
+
     B, T, N = F1.shape
     y1 = F1.new_zeros(B, N)
     y2 = F2.new_zeros(B, N)
@@ -156,7 +167,11 @@ def _linoss_recurrence(
 
 
 def _apply_linoss_im(
-    A_diag: torch.Tensor, B_complex: torch.Tensor, x: torch.Tensor, step: torch.Tensor
+    A_diag: torch.Tensor,
+    B_complex: torch.Tensor,
+    x: torch.Tensor,
+    step: torch.Tensor,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     Bu = _project_input(B_complex, x)
 
@@ -168,11 +183,15 @@ def _apply_linoss_im(
 
     F1 = M_11 * Bu * step
     F2 = M_21 * Bu * step
-    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2)
+    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2, use_triton=use_triton)
 
 
 def _apply_linoss_imex(
-    A_diag: torch.Tensor, B_complex: torch.Tensor, x: torch.Tensor, step: torch.Tensor
+    A_diag: torch.Tensor,
+    B_complex: torch.Tensor,
+    x: torch.Tensor,
+    step: torch.Tensor,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     Bu = _project_input(B_complex, x)
 
@@ -183,7 +202,7 @@ def _apply_linoss_imex(
 
     F1 = Bu * step
     F2 = Bu * step ** 2
-    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2)
+    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2, use_triton=use_triton)
 
 
 def _apply_damped_linoss_imex(
@@ -192,6 +211,7 @@ def _apply_damped_linoss_imex(
     B_complex: torch.Tensor,
     x: torch.Tensor,
     step: torch.Tensor,
+    use_triton: bool = False,
 ) -> torch.Tensor:
     Bu = _project_input(B_complex, x)
 
@@ -204,4 +224,4 @@ def _apply_damped_linoss_imex(
 
     F1 = (step * inv_S) * Bu
     F2 = (step ** 2 * inv_S) * Bu
-    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2)
+    return _linoss_recurrence(M_11, M_12, M_21, M_22, F1, F2, use_triton=use_triton)
