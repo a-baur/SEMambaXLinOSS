@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.linoss import LinOSS
+from models.linoss.linoss import LinOSS
 
 
 class MambaStyleLinOSS(nn.Module):

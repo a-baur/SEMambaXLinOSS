@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from models.linoss import LinOSS, _map_theta_to_A
+from models.linoss.linoss import LinOSS, _map_theta_to_A
 
 
 VARIANTS = [
