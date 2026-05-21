@@ -151,9 +151,6 @@ class LinOSSScanFunction(torch.autograd.Function):
         if F1.shape != F2.shape:
             raise ValueError(f"F1 {F1.shape} != F2 {F2.shape}")
 
-        # Contiguize once: the kernel reads M_ij with implicit unit stride
-        # (`M_ij_ptr + offs_n`), so the same tensor must back both the forward
-        # launch and the saved-for-backward copy.
         M_11 = M_11.contiguous()
         M_12 = M_12.contiguous()
         M_21 = M_21.contiguous()

@@ -1,27 +1,50 @@
 # Reference: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
 
+import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import init
-from torch.nn.parameter import Parameter
 from functools import partial
-from einops import rearrange
 
 from mamba_ssm.modules.mamba_simple import Mamba, Block
 from mamba_ssm.models.mixer_seq_simple import _init_weights
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 
+from models.linoss.block import MambaStyleLinOSS
+
 # github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
 def create_block(
-    d_model, cfg, layer_idx=0, rms_norm=True, fused_add_norm=False, residual_in_fp32=False, 
+    d_model, cfg, layer_idx=0, rms_norm=True, fused_add_norm=False, residual_in_fp32=False,
     ):
-    d_state = cfg['model_cfg']['d_state'] # 16
-    d_conv = cfg['model_cfg']['d_conv'] # 4
-    expand = cfg['model_cfg']['expand'] # 4
-    norm_epsilon = cfg['model_cfg']['norm_epsilon'] # 0.00001
+    model_cfg = cfg['model_cfg']
+    d_state = model_cfg['d_state']            # 16
+    d_conv = model_cfg['d_conv']              # 4
+    expand = model_cfg['expand']              # 4
+    norm_epsilon = model_cfg['norm_epsilon']  # 0.00001
+    mixer_name = str(model_cfg.get('mixer', 'mamba')).lower()
 
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, d_state=d_state, d_conv=d_conv, expand=expand)
+    if mixer_name == 'mamba':
+        mixer_cls = partial(
+            Mamba, layer_idx=layer_idx, d_state=d_state, d_conv=d_conv, expand=expand,
+        )
+    elif mixer_name == 'linoss':
+        mixer_cls = partial(
+            MambaStyleLinOSS,
+            state_dim=d_state,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get('linoss_causal_conv', True),
+            discretization=model_cfg.get('linoss_discretization', 'IMEX'),
+            damping=model_cfg.get('linoss_damping', True),
+            r_min=model_cfg.get('linoss_r_min', 0.9),
+            theta_max=model_cfg.get('linoss_theta_max', math.pi),
+            use_triton=model_cfg.get('linoss_use_triton', False),
+        )
+    else:
+        raise ValueError(
+            f"Unknown mixer {mixer_name!r}; expected 'mamba' or 'linoss'."
+        )
+
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon
     )

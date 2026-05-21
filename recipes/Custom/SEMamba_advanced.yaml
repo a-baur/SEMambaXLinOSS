@@ -64,3 +64,13 @@ model_cfg:
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement
+  # Sequence mixer selection: 'mamba' (default) or 'linoss'. When 'linoss',
+  # the keys below configure the inner LinOSS SSM; d_state/d_conv/expand above
+  # are reused (mapped to LinOSS state_dim / d_conv / expand).
+  mixer: linoss
+  linoss_discretization: IMEX   # 'IM' or 'IMEX'
+  linoss_damping: true          # damped IMEX (ignored when discretization='IM')
+  linoss_r_min: 0.9             # initialization radius lower bound
+  linoss_theta_max: 3.141592653589793  # initialization angle upper bound (pi)
+  linoss_causal_conv: true      # causal depthwise conv before the SSM
+  linoss_use_triton: false      # enable the Triton-accelerated LinOSS scan kernel

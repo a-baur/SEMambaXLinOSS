@@ -12,11 +12,10 @@ recurrence (PyTorch has no built-in associative scan).
 from __future__ import annotations
 
 import math
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 import torch.nn as nn
-from torch._higher_order_ops.associative_scan import associative_scan  # noqa
 
 
 class LinOSS(nn.Module):
@@ -151,7 +150,7 @@ def _linoss_recurrence(
     #   [y1; y2]_t = [[M_11, M_12], [M_21, M_22]] [y1; y2]_{t-1} + [F1; F2]_t
     # with y_0 = 0. Returns the y2 trajectory.
     if use_triton:
-        from models.linoss_triton import linoss_scan_triton
+        from models.linoss.triton import linoss_scan_triton
         return linoss_scan_triton(M_11, M_12, M_21, M_22, F1, F2)
 
     B, T, N = F1.shape
