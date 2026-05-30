@@ -3,12 +3,13 @@
 # Adjust `num_gpus` and `dist_config` according to your distributed training environment.
 env_setting:
   num_gpus: 3  # Number of GPUs. Now we don't support CPU mode.
-  num_workers: 20  # Number of worker threads for data loading.
+  num_workers: 16  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
   stdout_interval: 10
   checkpoint_interval: 1000  # save model to ckpt every N steps
   validation_interval: 1000
   summary_interval: 100
+  num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
     dist_url: tcp://localhost:19477  # URL for initializing distributed training.
@@ -16,12 +17,12 @@ env_setting:
 
 # Datapath Configuratoin
 data_cfg:
-  train_clean_json: data/train_clean_vb_dmd.json
-  train_noisy_json: data/train_noisy_vb_dmd.json
-  valid_clean_json: data/valid_clean_vb_dmd.json
-  valid_noisy_json: data/valid_noisy_vb_dmd.json
-  test_clean_json: data/test_clean_vb_dmd.json
-  test_noisy_json: data/test_noisy_vb_dmd.json
+  train_clean_json: data/ears_wham_16k/train_clean.json
+  train_noisy_json: data/ears_wham_16k/train_noisy.json
+  valid_clean_json: data/ears_wham_16k/valid_clean.json
+  valid_noisy_json: data/ears_wham_16k/valid_noisy.json
+  test_clean_json: data/ears_wham_16k/test_clean.json
+  test_noisy_json: data/ears_wham_16k/test_noisy.json
 
 # Training Configuration
 # This section details parameters that directly influence the training process,
@@ -67,7 +68,7 @@ model_cfg:
   # Sequence mixer selection: 'mamba' (default) or 'linoss'. When 'linoss',
   # the keys below configure the inner LinOSS SSM; d_state/d_conv/expand above
   # are reused (mapped to LinOSS state_dim / d_conv / expand).
-  mixer: linoss
+  mixer: mamba
   linoss_discretization: IMEX   # 'IM' or 'IMEX'
   linoss_damping: true          # damped IMEX (ignored when discretization='IM')
   linoss_r_min: 0.9             # initialization radius lower bound
