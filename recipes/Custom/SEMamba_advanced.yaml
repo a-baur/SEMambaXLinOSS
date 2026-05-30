@@ -57,21 +57,29 @@ stft_cfg:
 model_cfg:
   hid_feature: 64  # Channels in dense layers.
   compress_factor: 0.3  # Compression factor applied to extracted features.
-  num_tfmamba: 4  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
-  d_state: 16  # Dimensionality of the state vector in Mamba blocks.
-  d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
-  expand: 4  # Expansion factor for the layers within the Mamba blocks.
-  norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+  num_tfmamba: 4  # Number of Time-Frequency blocks in the model.
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement
-  # Sequence mixer selection: 'mamba' (default) or 'linoss'. When 'linoss',
-  # the keys below configure the inner LinOSS SSM; d_state/d_conv/expand above
-  # are reused (mapped to LinOSS state_dim / d_conv / expand).
-  mixer: mamba
-  linoss_discretization: IMEX   # 'IM' or 'IMEX'
-  linoss_damping: true          # damped IMEX (ignored when discretization='IM')
-  linoss_r_min: 0.9             # initialization radius lower bound
-  linoss_theta_max: 3.141592653589793  # initialization angle upper bound (pi)
-  linoss_causal_conv: true      # causal depthwise conv before the SSM
-  linoss_use_triton: true      # enable the Triton-accelerated LinOSS scan kernel
+
+  # Mixer for time blocks
+  time_mixer:
+    mixer: mamba
+    d_state: 16  # Dimensionality of the state vector in Mamba blocks.
+    d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
+    expand: 4  # Expansion factor for the layers within the Mamba blocks.
+    norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+
+  # Mixer for frequency blocks
+  freq_mixer:
+    mixer: linoss
+    d_state: 16  # Dimensionality of the state vector in Mamba blocks.
+    d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
+    expand: 4  # Expansion factor for the layers within the Mamba blocks.
+    norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
+    linoss_discretization: IMEX   # 'IM' or 'IMEX'
+    linoss_damping: true          # damped IMEX (ignored when discretization='IM')
+    linoss_r_min: 0.9             # initialization radius lower bound
+    linoss_theta_max: 3.141592653589793  # initialization angle upper bound (pi)
+    linoss_causal_conv: true      # causal depthwise conv before the SSM
+    linoss_use_triton: true      # enable the Triton-accelerated LinOSS scan kernel

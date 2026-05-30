@@ -399,7 +399,7 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='Mamba_EARS')
+    parser.add_argument('--exp_name', default='Hybrid_EARS')
     parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/Custom/SEMamba_advanced.yaml')
     args = parser.parse_args()
 

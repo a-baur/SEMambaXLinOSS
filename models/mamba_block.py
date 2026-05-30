@@ -14,14 +14,14 @@ from models.linoss.block import MambaStyleLinOSS
 
 # github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
 def create_block(
-    d_model, cfg, layer_idx=0, rms_norm=True, fused_add_norm=False, residual_in_fp32=False,
+    d_model, model_cfg, layer_idx=0, rms_norm=True, fused_add_norm=False, residual_in_fp32=False,
     ):
-    model_cfg = cfg['model_cfg']
+    mixer_name = model_cfg['mixer']
     d_state = model_cfg['d_state']            # 16
     d_conv = model_cfg['d_conv']              # 4
     expand = model_cfg['expand']              # 4
     norm_epsilon = model_cfg['norm_epsilon']  # 0.00001
-    mixer_name = str(model_cfg.get('mixer', 'mamba')).lower()
+
 
     if mixer_name == 'mamba':
         mixer_cls = partial(
@@ -59,11 +59,11 @@ def create_block(
     return block
 
 class MambaBlock(nn.Module):
-    def __init__(self, in_channels, cfg):
+    def __init__(self, in_channels, cfg, mixer=None):
         super(MambaBlock, self).__init__()
         n_layer = 1
-        self.forward_blocks  = nn.ModuleList( create_block(in_channels, cfg) for i in range(n_layer) )
-        self.backward_blocks = nn.ModuleList( create_block(in_channels, cfg) for i in range(n_layer) )
+        self.forward_blocks  = nn.ModuleList( create_block(in_channels, cfg) for _ in range(n_layer) )
+        self.backward_blocks = nn.ModuleList( create_block(in_channels, cfg) for _ in range(n_layer) )
 
         self.apply(
             partial(
@@ -103,10 +103,13 @@ class TFMambaBlock(nn.Module):
         super(TFMambaBlock, self).__init__()
         self.cfg = cfg
         self.hid_feature = cfg['model_cfg']['hid_feature']
-        
-        # Initialize Mamba blocks
-        self.time_mamba = MambaBlock(in_channels=self.hid_feature, cfg=cfg)
-        self.freq_mamba = MambaBlock(in_channels=self.hid_feature, cfg=cfg)
+
+        # Initialize Mamba blocks. Per-axis mixer sub-dicts ('time_mixer' /
+        # 'freq_mixer') enable a LinOSS/Mamba hybrid; older flat configs fall
+        # back to model_cfg itself (same shape create_block expects).
+        mcfg = cfg['model_cfg']
+        self.time_mamba = MambaBlock(in_channels=self.hid_feature, cfg=mcfg.get('time_mixer', mcfg))
+        self.freq_mamba = MambaBlock(in_channels=self.hid_feature, cfg=mcfg.get('freq_mixer', mcfg))
         
         # Initialize ConvTranspose1d layers
         self.tlinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
