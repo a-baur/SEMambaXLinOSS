@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 import torch
@@ -6,6 +7,9 @@ import torch.utils.data
 import librosa
 from models.stfts import mag_phase_stft, mag_phase_istft
 from models.pcs400 import cal_pcs
+
+# Matches a trailing SNR suffix such as "_9.5dB" or "_-1.3dB" (EARS-WHAM noisy files).
+_SNR_SUFFIX_RE = re.compile(r'_-?\d+(?:\.\d+)?dB$')
 
 def list_files_in_directory(directory_path):
     files = []
@@ -20,11 +24,27 @@ def load_json_file(file_path):
         data = json.load(json_file)
     return data
 
-def extract_identifier(file_path):
-    return os.path.basename(file_path)
+def _common_root(file_paths):
+    """Deepest directory shared by all paths (used to build a dataset-relative key)."""
+    if len(file_paths) == 1:
+        return os.path.dirname(file_paths[0])
+    return os.path.commonpath(file_paths)
 
-def get_clean_path_for_noisy(noisy_file_path, clean_path_dict):
-    identifier = extract_identifier(noisy_file_path)
+def extract_identifier(file_path, root):
+    """
+    Build a matching key from the path relative to its dataset root, with the
+    extension and any trailing SNR suffix removed.
+
+    This pairs clean/noisy files for both:
+      - VCTK-DEMAND (flat dirs, identical basenames): "p231_272"
+      - EARS-WHAM   (per-speaker dirs, "_<snr>dB" suffix): "p001/00000"
+    """
+    rel = os.path.relpath(file_path, root)
+    stem = os.path.splitext(rel)[0]
+    return _SNR_SUFFIX_RE.sub('', stem)
+
+def get_clean_path_for_noisy(noisy_file_path, noisy_root, clean_path_dict):
+    identifier = extract_identifier(noisy_file_path, noisy_root)
     return clean_path_dict.get(identifier, None)
 
 class VCTKDemandDataset(torch.utils.data.Dataset):
@@ -69,7 +89,14 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
 
         if shuffle:
             random.shuffle(self.noisy_wavs_path)
-        self.clean_path_dict = {extract_identifier(clean_path): clean_path for clean_path in self.clean_wavs_path}
+
+        # Roots used to derive dataset-relative matching keys for clean/noisy pairing.
+        self.clean_root = _common_root(self.clean_wavs_path)
+        self.noisy_root = _common_root(self.noisy_wavs_path)
+        self.clean_path_dict = {
+            extract_identifier(clean_path, self.clean_root): clean_path
+            for clean_path in self.clean_wavs_path
+        }
 
         self.sampling_rate = sampling_rate
         self.segment_size = segment_size
@@ -98,7 +125,12 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
         """
         if self._cache_ref_count == 0:
             noisy_path = self.noisy_wavs_path[index]
-            clean_path = get_clean_path_for_noisy(noisy_path, self.clean_path_dict)
+            clean_path = get_clean_path_for_noisy(noisy_path, self.noisy_root, self.clean_path_dict)
+            if clean_path is None:
+                raise FileNotFoundError(
+                    f"No matching clean file for noisy file {noisy_path!r} "
+                    f"(matching key {extract_identifier(noisy_path, self.noisy_root)!r})"
+                )
             noisy_audio, _ = librosa.load( noisy_path, sr=self.sampling_rate)
             clean_audio, _ = librosa.load( clean_path, sr=self.sampling_rate)
             if self.pcs == True:
