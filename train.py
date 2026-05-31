@@ -6,8 +6,6 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import os
 import time
 import argparse
-import matplotlib
-matplotlib.use('Agg')  # headless backend, no display required on training nodes
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -399,7 +397,7 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='Hybrid_EARS')
+    parser.add_argument('--exp_name', default='Hybrid_LinTime_FullFAN_EARS')
     parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/Custom/SEMamba_advanced.yaml')
     args = parser.parse_args()
 

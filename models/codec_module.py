@@ -68,6 +68,73 @@ class DenseBlock(nn.Module):
             x = self.dense_block[i](skip)
             skip = torch.cat([x, skip], dim=1)
         return x
+class FANDenseLayer(nn.Module):
+    """A single dense-block layer with a FAN-style split activation.
+
+    The conventional layer is  conv -> InstanceNorm -> PReLU  producing
+    `hid_feature` channels. Here the same `hid_feature` output is split into:
+        - a periodic part: cos(conv_p(x)) and sin(conv_p(x))   -> 2 * c_p channels
+        - a gated part:    PReLU(InstanceNorm(conv_g(x)))       ->     c_g channels
+    with 2 * c_p + c_g == hid_feature, so the dense-concat bookkeeping and the
+    downstream dense_conv_2 are unchanged.
+
+    Note: cos/sin are bounded in [-1, 1], so the periodic branch is left un-normed
+    (normalising before a periodic nonlinearity is not what FAN does and is unneeded).
+    The periodic conv is initialised small to avoid high-frequency oscillation across
+    adjacent T-F bins; conv_p carries no bias (FAN's W_p has no bias term).
+    """
+
+    def __init__(
+        self, in_channels, hid_feature, kernel_size=(3, 3), dilation=(1, 1), periodic_init_std=1e-2
+    ):
+        super(FANDenseLayer, self).__init__()
+        self.c_p = hid_feature // 4
+        self.c_g = hid_feature - 2 * self.c_p  # guarantees 2*c_p + c_g == hid_feature
+        pad = get_padding_2d(kernel_size, dilation)
+
+        self.conv_p = nn.Conv2d(
+            in_channels, self.c_p, kernel_size, dilation=dilation, padding=pad, bias=False
+        )
+        self.conv_g = nn.Conv2d(in_channels, self.c_g, kernel_size, dilation=dilation, padding=pad)
+        self.norm_g = nn.InstanceNorm2d(self.c_g, affine=True)
+        self.act_g = nn.PReLU(self.c_g)
+
+        nn.init.normal_(self.conv_p.weight, std=periodic_init_std)
+
+    def forward(self, x):
+        zp = self.conv_p(x)
+        zg = self.act_g(self.norm_g(self.conv_g(x)))
+        return torch.cat([torch.cos(zp), torch.sin(zp), zg], dim=1)  # hid_feature channels
+
+
+class FANDenseBlock(nn.Module):
+    """DenseBlock variant using FANDenseLayer. Drop-in shape-compatible with DenseBlock."""
+
+    def __init__(self, cfg, kernel_size=(3, 3), depth=4):
+        super(FANDenseBlock, self).__init__()
+        self.cfg = cfg
+        self.depth = depth
+        self.hid_feature = cfg["model_cfg"]["hid_feature"]
+        self.dense_block = nn.ModuleList()
+
+        for i in range(depth):
+            dil = 2**i
+            self.dense_block.append(
+                FANDenseLayer(
+                    self.hid_feature * (i + 1),
+                    self.hid_feature,
+                    kernel_size=kernel_size,
+                    dilation=(dil, 1),
+                )
+            )
+
+    def forward(self, x):
+        skip = x
+        for i in range(self.depth):
+            x = self.dense_block[i](skip)
+            skip = torch.cat([x, skip], dim=1)
+        return x
+
 
 class DenseEncoder(nn.Module):
     """
@@ -76,37 +143,52 @@ class DenseEncoder(nn.Module):
     def __init__(self, cfg):
         super(DenseEncoder, self).__init__()
         self.cfg = cfg
-        self.input_channel = cfg['model_cfg']['input_channel']
-        self.hid_feature = cfg['model_cfg']['hid_feature']
+        self.input_channel = cfg["model_cfg"]["input_channel"]
+        self.hid_feature = cfg["model_cfg"]["hid_feature"]
+
+        self.use_phase_fan = cfg["model_cfg"].get("use_phase_fan", False)
+        self.use_fan_denseblock = cfg["model_cfg"].get("use_fan_denseblock", False)
+
+        if self.use_phase_fan:
+            assert self.input_channel == 2, (
+                "use_phase_fan assumes input_channel == 2 ([magnitude, wrapped_phase])"
+            )
+            # learnable frequency; init 1.0 == plain (cos, sin) angle encoding
+            self.phase_freq = nn.Parameter(torch.ones(1))
+            conv1_in = self.input_channel + 1  # mag + cos(phi) + sin(phi)
+        else:
+            conv1_in = self.input_channel
 
         self.dense_conv_1 = nn.Sequential(
-            nn.Conv2d(self.input_channel, self.hid_feature, (1, 1)),
+            nn.Conv2d(conv1_in, self.hid_feature, (1, 1)),
             nn.InstanceNorm2d(self.hid_feature, affine=True),
-            nn.PReLU(self.hid_feature)
+            nn.PReLU(self.hid_feature),
         )
 
-        self.dense_block = DenseBlock(cfg, depth=4)
+        block_cls = FANDenseBlock if self.use_fan_denseblock else DenseBlock
+        self.dense_block = block_cls(cfg, depth=4)
 
         self.dense_conv_2 = nn.Sequential(
             nn.Conv2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, 2)),
             nn.InstanceNorm2d(self.hid_feature, affine=True),
-            nn.PReLU(self.hid_feature)
+            nn.PReLU(self.hid_feature),
         )
 
+    def _phase_lift(self, x):
+        # x: [B, 2, T, F] -> [B, 3, T, F]
+        mag = x[:, :1]
+        phi = x[:, 1:2]
+        z = self.phase_freq * phi
+        return torch.cat([mag, torch.cos(z), torch.sin(z)], dim=1)
+
     def forward(self, x):
-        """
-        Forward pass for the DenseEncoder module.
-        
-        Args:
-        - x (torch.Tensor): Input tensor.
-        
-        Returns:
-        - torch.Tensor: Encoded tensor.
-        """
+        if self.use_phase_fan:
+            x = self._phase_lift(x)  # [batch, 3, time, freq]
         x = self.dense_conv_1(x)  # [batch, hid_feature, time, freq]
-        x = self.dense_block(x)   # [batch, hid_feature, time, freq]
+        x = self.dense_block(x)  # [batch, hid_feature, time, freq]
         x = self.dense_conv_2(x)  # [batch, hid_feature, time, freq//2]
         return x
+
 
 class MagDecoder(nn.Module):
     """

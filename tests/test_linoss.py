@@ -17,13 +17,15 @@ VARIANTS = [
 ]
 
 
-def _make(in_features=8, state_dim=16, discretization="IMEX", damping=True, seed=0):
+def _make(in_features=8, state_dim=16, discretization="IMEX", damping=True,
+          selective_damping=False, seed=0):
     torch.manual_seed(seed)
     return LinOSS(
         in_features=in_features,
         state_dim=state_dim,
         discretization=discretization,
         damping=damping,
+        selective_damping=selective_damping,
     )
 
 
@@ -151,6 +153,7 @@ def _copy_model_to(model: LinOSS, device: torch.device, use_triton: bool) -> Lin
         state_dim=model.state_dim,
         discretization=model.discretization,
         damping=model.damping,
+        selective_damping=model.selective_damping,
         use_triton=use_triton,
     ).to(device)
     with torch.no_grad():
@@ -242,3 +245,119 @@ def test_map_theta_to_A_matches_formula():
     A_high = _map_theta_to_A(thetas_high, G, steps)
     assert torch.isfinite(A_low).all()
     assert torch.isfinite(A_high).all()
+
+
+# --- Selective (input-dependent) damping --------------------------------------
+
+
+def test_selective_forward_shape_and_dtype():
+    model = _make(selective_damping=True)
+    x = torch.randn(2, 7, 8)
+    y = model(x)
+    assert y.shape == (2, 7, 8)
+    assert y.dtype == torch.float32
+    assert torch.isfinite(y).all()
+
+
+def test_selective_backward_flows_to_g_head_and_input():
+    model = _make(selective_damping=True)
+    assert model.G_proj is not None
+    x = torch.randn(2, 7, 8, requires_grad=True)
+    model(x).sum().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    # The damping head must receive gradient — otherwise selectivity is dead.
+    assert model.G_proj.weight.grad is not None
+    assert model.G_proj.weight.grad.abs().sum() > 0
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"no grad for {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad for {name}"
+
+
+def test_selective_causality():
+    model = _make(selective_damping=True).eval()
+    x = torch.randn(1, 10, 8)
+    t_perturb = 5
+    with torch.no_grad():
+        y_ref = model(x)
+        x_pert = x.clone()
+        x_pert[:, t_perturb:] += torch.randn_like(x_pert[:, t_perturb:])
+        y_pert = model(x_pert)
+    assert torch.allclose(y_ref[:, :t_perturb], y_pert[:, :t_perturb], atol=1e-6)
+    assert not torch.allclose(y_ref[:, t_perturb:], y_pert[:, t_perturb:])
+
+
+def test_selective_batch_independence():
+    # G(u) is computed per sample, so batching must still be independent.
+    model = _make(selective_damping=True).eval()
+    x0 = torch.randn(1, 6, 8)
+    x1 = torch.randn(1, 6, 8)
+    with torch.no_grad():
+        y_batched = model(torch.cat([x0, x1], dim=0))
+        y_split = torch.cat([model(x0), model(x1)], dim=0)
+    assert torch.allclose(y_batched, y_split, atol=1e-6)
+
+
+def test_selective_matches_static_at_init():
+    # G_proj is initialized (weight=0, bias=softplus^{-1}(static G)) so the
+    # selective model reproduces the non-selective one exactly at init.
+    static = _make(selective_damping=False, seed=0).eval()
+    selective = _make(selective_damping=True, seed=0).eval()
+    x = torch.randn(2, 9, 8)
+    with torch.no_grad():
+        assert torch.allclose(selective(x), static(x), atol=1e-5)
+
+
+@pytest.mark.parametrize("discretization,damping", [("IM", False), ("IMEX", False)])
+def test_selective_requires_imex_damped(discretization, damping):
+    with pytest.raises(NotImplementedError):
+        LinOSS(in_features=8, discretization=discretization, damping=damping,
+               selective_damping=True)
+
+
+def test_selective_g_proj_only_when_selective():
+    assert _make(selective_damping=False).G_proj is None
+    assert _make(selective_damping=True).G_proj is not None
+
+
+@cuda_only
+def test_triton_selective_forward_matches_reference():
+    cpu_model = _make(in_features=4, state_dim=16, selective_damping=True)
+    triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
+    ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
+
+    torch.manual_seed(123)
+    x = torch.randn(3, 17, 4, device="cuda")
+    with torch.no_grad():
+        y_ref = ref_model(x)
+        y_triton = triton_model(x)
+    assert torch.allclose(y_triton, y_ref, atol=1e-5, rtol=1e-5), (
+        f"max abs diff: {(y_triton - y_ref).abs().max().item()}"
+    )
+
+
+@cuda_only
+def test_triton_selective_backward_matches_reference():
+    cpu_model = _make(in_features=4, state_dim=16, selective_damping=True)
+    triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
+    ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
+
+    torch.manual_seed(7)
+    x = torch.randn(2, 13, 4, device="cuda")
+    x_ref = x.detach().clone().requires_grad_(True)
+    x_tri = x.detach().clone().requires_grad_(True)
+
+    ref_model(x_ref).sum().backward()
+    triton_model(x_tri).sum().backward()
+
+    assert torch.allclose(x_tri.grad, x_ref.grad, atol=1e-4, rtol=1e-4), (
+        f"x.grad max abs diff: {(x_tri.grad - x_ref.grad).abs().max().item()}"
+    )
+    ref_params = dict(ref_model.named_parameters())
+    for name, p in triton_model.named_parameters():
+        ref_grad = ref_params[name].grad
+        assert p.grad is not None and ref_grad is not None, f"missing grad for {name}"
+        max_diff = (p.grad - ref_grad).abs().max().item()
+        assert torch.allclose(p.grad, ref_grad, atol=1e-4, rtol=1e-4), (
+            f"{name} grad mismatch, max abs diff: {max_diff}"
+        )

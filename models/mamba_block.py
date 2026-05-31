@@ -59,7 +59,7 @@ def create_block(
     return block
 
 class MambaBlock(nn.Module):
-    def __init__(self, in_channels, cfg, mixer=None):
+    def __init__(self, in_channels, cfg):
         super(MambaBlock, self).__init__()
         n_layer = 1
         self.forward_blocks  = nn.ModuleList( create_block(in_channels, cfg) for _ in range(n_layer) )
