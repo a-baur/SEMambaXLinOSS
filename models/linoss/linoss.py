@@ -48,6 +48,7 @@ class LinOSS(nn.Module):
         self.state_dim = state_dim
         self.discretization = discretization
         self.damping = damping
+        self.A_from_G = False
         self.use_triton = use_triton
 
         self.steps = nn.Parameter(torch.randn(state_dim) * 0.5)
@@ -82,30 +83,37 @@ class LinOSS(nn.Module):
         B_complex = torch.complex(self.B[..., 0], self.B[..., 1])
         C_complex = torch.complex(self.C[..., 0], self.C[..., 1])
 
+        Bu = _project_input(B_complex, x)
         if self.discretization == "IM":
             A_diag = torch.relu(self.A_diag)
-            ys = _apply_linoss_im(A_diag, B_complex, x, steps, use_triton=self.use_triton)
+            ys = _apply_linoss_im(A_diag, Bu, steps, use_triton=self.use_triton)
         else:  # IMEX
             if self.damping:
-                G_diag = torch.relu(self.G_diag)
-                sqrt_term = torch.sqrt(1.0 + steps * G_diag)
-                A_low = (2.0 + steps * G_diag - 2.0 * sqrt_term) / steps ** 2
-                A_high = (2.0 + steps * G_diag + 2.0 * sqrt_term) / steps ** 2
-                A_diag = (
-                    A_low
-                    + torch.relu(self.A_diag - A_low)
-                    - torch.relu(self.A_diag - A_high)
-                )
+
+                if self.A_from_G:
+                    # enforce stability constraint (3.2)
+                    G_diag = torch.relu(self.G_diag)
+                    sqrt_term = torch.sqrt(1.0 + steps * G_diag)
+                    A_low = (2.0 + steps * G_diag - 2.0 * sqrt_term) / steps ** 2
+                    A_high = (2.0 + steps * G_diag + 2.0 * sqrt_term) / steps ** 2
+                    A_diag = (
+                        A_low
+                        + torch.relu(self.A_diag - A_low)
+                        - torch.relu(self.A_diag - A_high)
+                    )
+                else:
+                    A_diag = torch.relu(self.A_diag)
+                    G_low = torch.relu(steps * A_diag - 2 * torch.sqrt(A_diag))
+                    G_high = steps * A_diag + 2 * torch.sqrt(A_diag)
+                    G_diag = torch.clamp(self.G_diag, min=G_low, max=G_high)
+
                 ys = _apply_damped_linoss_imex(
-                    A_diag, G_diag, B_complex, x, steps, use_triton=self.use_triton
+                    A_diag, G_diag, Bu, steps, use_triton=self.use_triton
                 )
             else:
                 A_diag = torch.relu(self.A_diag)
-                ys = _apply_linoss_imex(
-                    A_diag, B_complex, x, steps, use_triton=self.use_triton
-                )
+                ys = _apply_linoss_imex(A_diag, Bu, steps, use_triton=self.use_triton)
 
-        # Cy + Du
         Cy = torch.einsum("fn,btn->btf", C_complex, ys).real
         Du = x * self.D
         return Cy + Du
@@ -113,6 +121,12 @@ class LinOSS(nn.Module):
 
 def _uniform_init(shape, std: float = 1.0) -> torch.Tensor:
     return torch.empty(*shape).uniform_(-std, std)
+
+
+def _complex_coeff(proj: nn.Linear, x: torch.Tensor, state_dim: int) -> torch.Tensor:
+    # (B, T, in_features) -> complex (B, T, state_dim) via a real/imag split.
+    sel = proj(x)
+    return torch.complex(sel[..., :state_dim], sel[..., state_dim:])
 
 
 def _map_theta_to_A(
@@ -167,13 +181,10 @@ def _linoss_recurrence(
 
 def _apply_linoss_im(
     A_diag: torch.Tensor,
-    B_complex: torch.Tensor,
-    x: torch.Tensor,
+    Bu: torch.Tensor,
     step: torch.Tensor,
     use_triton: bool = False,
 ) -> torch.Tensor:
-    Bu = _project_input(B_complex, x)
-
     schur = 1.0 / (1.0 + step ** 2 * A_diag)
     M_11 = 1.0 - step ** 2 * A_diag * schur
     M_12 = -step * A_diag * schur
@@ -187,13 +198,10 @@ def _apply_linoss_im(
 
 def _apply_linoss_imex(
     A_diag: torch.Tensor,
-    B_complex: torch.Tensor,
-    x: torch.Tensor,
+    Bu: torch.Tensor,
     step: torch.Tensor,
     use_triton: bool = False,
 ) -> torch.Tensor:
-    Bu = _project_input(B_complex, x)
-
     M_11 = torch.ones_like(A_diag)
     M_12 = -step * A_diag
     M_21 = step
@@ -207,13 +215,10 @@ def _apply_linoss_imex(
 def _apply_damped_linoss_imex(
     A_diag: torch.Tensor,
     G_diag: torch.Tensor,
-    B_complex: torch.Tensor,
-    x: torch.Tensor,
+    Bu: torch.Tensor,
     step: torch.Tensor,
     use_triton: bool = False,
 ) -> torch.Tensor:
-    Bu = _project_input(B_complex, x)
-
     S = 1.0 + step * G_diag
     inv_S = 1.0 / S
     M_11 = inv_S

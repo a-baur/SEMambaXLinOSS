@@ -12,7 +12,11 @@ Mirrors the standard Mamba block:
 LinOSS replaces Mamba's *selective* SSM with a non-selective one — that's the
 only structural difference. ``x_proj``/``dt_proj`` have no analog since LinOSS
 has fixed ``(A, B, C)``; the rest of the wiring (``in_proj``, depthwise causal
-conv, SiLU gating, ``out_proj``) is faithful to the Mamba block.
+conv, SiLU gating, ``out_proj``) is faithful to the Mamba block. The optional
+``selective_b``/``selective_c``/``selective_d`` flags reintroduce a limited form
+of selectivity: Mamba-style input-dependent ``B``/``C``/``D`` (see ``LinOSS``),
+which make the input->state, state->output, and skip maps content-dependent
+while keeping the oscillator dynamics fixed.
 
 Port of ``MambaStyleLinOSSSequenceMixer`` from the JAX/Equinox ``linax`` repo.
 """
@@ -45,8 +49,7 @@ class MambaStyleLinOSS(nn.Module):
         d_conv: Depthwise conv kernel size along the sequence axis. Default 4.
         causal_conv: If True, the depthwise conv is causal via left-padding so
             position ``t`` only sees positions ``<= t``. Default True.
-        discretization, damping, r_min, theta_max, use_triton: Forwarded to the
-            inner ``LinOSS`` SSM.
+        discretization, damping, r_min, theta_max, use_triton
     """
 
     def __init__(
