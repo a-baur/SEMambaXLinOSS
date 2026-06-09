@@ -40,9 +40,26 @@ def create_block(
             theta_max=model_cfg.get('linoss_theta_max', math.pi),
             use_triton=model_cfg.get('linoss_use_triton', False),
         )
+    elif mixer_name == 'selective_linoss':
+        mixer_cls = partial(
+            MambaStyleLinOSS,
+            state_dim=d_state,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get('linoss_causal_conv', True),
+            selective=True,
+            r_min=model_cfg.get('linoss_r_min', 0.9),
+            theta_max=model_cfg.get('linoss_theta_max', math.pi),
+            selective_init_std=model_cfg.get('slinoss_init_std', 1e-2),
+            selective_normalize_input=model_cfg.get('slinoss_normalize_input', True),
+            selective_use_triton=model_cfg.get(
+                'slinoss_use_triton', model_cfg.get('linoss_use_triton', False)
+            ),
+        )
     else:
         raise ValueError(
-            f"Unknown mixer {mixer_name!r}; expected 'mamba' or 'linoss'."
+            f"Unknown mixer {mixer_name!r}; expected 'mamba', 'linoss', or "
+            "'selective_linoss'."
         )
 
     norm_cls = partial(

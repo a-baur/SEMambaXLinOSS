@@ -64,7 +64,7 @@ model_cfg:
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement
 
-  mixer: linoss
+  mixer: mamba
   d_state: 16  # Dimensionality of the state vector in Mamba blocks.
   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
   expand: 4  # Expansion factor for the layers within the Mamba blocks.

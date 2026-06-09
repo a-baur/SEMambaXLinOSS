@@ -20,6 +20,7 @@ from models.generator import SEMamba
 from models.loss import phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
 from models.linoss.linoss import LinOSS
+from models.linoss.selective_linoss import SelectiveLinOSS
 from utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
     build_env, load_config, initialize_seed,
@@ -42,6 +43,15 @@ def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=
                 if param is not None and param.requires_grad:
                     ssm_params.append(param)
                     ssm_param_ids.add(id(param))
+        elif isinstance(module, SelectiveLinOSS):
+            # Only the baseline-bank biases (c_nu, c_theta) — the S-LinOSS analog of the
+            # LTI dynamics scalars steps/A_diag/G_diag — get the low SSM LR. The selective
+            # weight matrices W_nu/W_theta *are* the input-dependence; they start tiny and
+            # must train at the base LR to learn, so they fall through to rest_params.
+            for proj in [module.nu_proj, module.theta_proj]:
+                if proj.bias is not None and proj.bias.requires_grad:
+                    ssm_params.append(proj.bias)
+                    ssm_param_ids.add(id(proj.bias))
 
     for param in model.parameters():
         if param.requires_grad and id(param) not in ssm_param_ids:
@@ -397,7 +407,7 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='LinOSS_selectiveB_EARS')
+    parser.add_argument('--exp_name', default='Mamba_EARS')
     parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/Custom/SEMamba_advanced.yaml')
     args = parser.parse_args()
 

@@ -31,10 +31,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.linoss.linoss import LinOSS
+from models.linoss.selective_linoss import SelectiveLinOSS
 
 
 class MambaStyleLinOSS(nn.Module):
-    """LinOSS in the Mamba block surround.
+    """LinOSS (or selective S-LinOSS) in the Mamba block surround.
 
     Shapes:
         Input:  (batch, time, in_features)
@@ -49,7 +50,13 @@ class MambaStyleLinOSS(nn.Module):
         d_conv: Depthwise conv kernel size along the sequence axis. Default 4.
         causal_conv: If True, the depthwise conv is causal via left-padding so
             position ``t`` only sees positions ``<= t``. Default True.
-        discretization, damping, r_min, theta_max, use_triton
+        selective: If True, the SSM is ``SelectiveLinOSS`` (input-dependent
+            scaled-rotation transition) instead of the LTI ``LinOSS``. The
+            ``discretization``/``damping``/``use_triton`` args are then ignored.
+        discretization, damping, r_min, theta_max, use_triton: ``LinOSS`` config.
+        selective_init_std: ``SelectiveLinOSS`` selective-weight init std.
+        selective_normalize_input: ``SelectiveLinOSS`` sqrt(1-nu^2) input normalization.
+        selective_use_triton: Run ``SelectiveLinOSS`` via its Triton scan kernel.
     """
 
     def __init__(
@@ -59,11 +66,15 @@ class MambaStyleLinOSS(nn.Module):
         expand: int = 4,
         d_conv: int = 4,
         causal_conv: bool = True,
+        selective: bool = False,
         discretization: Literal["IM", "IMEX"] = "IMEX",
         damping: bool = True,
         r_min: float = 0.9,
         theta_max: float = math.pi,
         use_triton: bool = False,
+        selective_init_std: float = 1e-2,
+        selective_normalize_input: bool = True,
+        selective_use_triton: bool = False,
     ):
         super().__init__()
         inner_dim = expand * in_features
@@ -82,15 +93,26 @@ class MambaStyleLinOSS(nn.Module):
             padding=0,
         )
 
-        self.ssm = LinOSS(
-            in_features=inner_dim,
-            state_dim=state_dim,
-            discretization=discretization,
-            damping=damping,
-            r_min=r_min,
-            theta_max=theta_max,
-            use_triton=use_triton,
-        )
+        if selective:
+            self.ssm = SelectiveLinOSS(
+                in_features=inner_dim,
+                state_dim=state_dim,
+                r_min=r_min,
+                theta_max=theta_max,
+                selective_init_std=selective_init_std,
+                normalize_input=selective_normalize_input,
+                use_triton=selective_use_triton,
+            )
+        else:
+            self.ssm = LinOSS(
+                in_features=inner_dim,
+                state_dim=state_dim,
+                discretization=discretization,
+                damping=damping,
+                r_min=r_min,
+                theta_max=theta_max,
+                use_triton=use_triton,
+            )
 
         self.out_proj = nn.Linear(inner_dim, in_features, bias=False)
 
