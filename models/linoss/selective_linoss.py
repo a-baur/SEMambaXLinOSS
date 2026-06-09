@@ -40,7 +40,7 @@ import torch.nn as nn
 from models.linoss.linoss import _project_input, _uniform_init
 
 
-class SelectiveLinOSS(nn.Module):
+class MambOSS(nn.Module):
     """Selective oscillatory state-space mixer (scaled-rotation form).
 
     Shapes:

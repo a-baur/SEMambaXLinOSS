@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional, Literal
-from .jax_compat import associative_scan
-from .init import *
+from models.s5.jax_compat import associative_scan
+from models.s5.init import *
 
 # Runtime functions
 

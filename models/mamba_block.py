@@ -10,55 +10,85 @@ from mamba_ssm.modules.mamba_simple import Mamba, Block
 from mamba_ssm.models.mixer_seq_simple import _init_weights
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 
-from models.linoss.block import MambaStyleLinOSS
+from models.linoss.linoss import LinOSS
+from models.linoss.selective_linoss import MambOSS
+from models.mixer import MambaStyleMixer
+from models.s5.s5 import S5
+
 
 # github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
 def create_block(
-    d_model, model_cfg, layer_idx=0, rms_norm=True, fused_add_norm=False, residual_in_fp32=False,
+        d_model,
+        model_cfg,
+        layer_idx = 0,
+        rms_norm = True,
+        fused_add_norm = False,
+        residual_in_fp32 = False,
     ):
-    mixer_name = model_cfg['mixer']
+    ssm = model_cfg['ssm']
+    ssm_params = model_cfg.get('ssm_params', {})
+
     d_state = model_cfg['d_state']            # 16
     d_conv = model_cfg['d_conv']              # 4
     expand = model_cfg['expand']              # 4
     norm_epsilon = model_cfg['norm_epsilon']  # 0.00001
 
-
-    if mixer_name == 'mamba':
+    if ssm == 'mamba':
         mixer_cls = partial(
             Mamba, layer_idx=layer_idx, d_state=d_state, d_conv=d_conv, expand=expand,
         )
-    elif mixer_name == 'linoss':
-        mixer_cls = partial(
-            MambaStyleLinOSS,
+    elif ssm == 'linoss':
+        ssm = LinOSS(
+            in_features=expand * d_model,
             state_dim=d_state,
+            discretization=ssm_params.get("discretization", "IMEX"),
+            damping=ssm_params.get("damping", True),
+            r_min=ssm_params.get("r_min", 0.9),
+            theta_max=ssm_params.get("theta_max", math.pi),
+            use_triton=ssm_params.get("use_triton", False),
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
             expand=expand,
             d_conv=d_conv,
-            causal_conv=model_cfg.get('linoss_causal_conv', True),
-            discretization=model_cfg.get('linoss_discretization', 'IMEX'),
-            damping=model_cfg.get('linoss_damping', True),
-            r_min=model_cfg.get('linoss_r_min', 0.9),
-            theta_max=model_cfg.get('linoss_theta_max', math.pi),
-            use_triton=model_cfg.get('linoss_use_triton', False),
+            causal_conv=model_cfg.get("causal_conv", True),
         )
-    elif mixer_name == 'selective_linoss':
-        mixer_cls = partial(
-            MambaStyleLinOSS,
+
+    elif ssm == 'selective_linoss':
+        ssm = MambOSS(
+            in_features=expand * d_model,
             state_dim=d_state,
+            r_min=ssm_params.get('r_min', 0.9),
+            theta_max=ssm_params.get('theta_max', math.pi),
+            selective_init_std=ssm_params.get('init_std', 1e-2),
+            normalize_input=ssm_params.get('normalize_input', True),
+            use_triton=ssm_params.get("use_triton", False),
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
             expand=expand,
             d_conv=d_conv,
-            causal_conv=model_cfg.get('linoss_causal_conv', True),
-            selective=True,
-            r_min=model_cfg.get('linoss_r_min', 0.9),
-            theta_max=model_cfg.get('linoss_theta_max', math.pi),
-            selective_init_std=model_cfg.get('slinoss_init_std', 1e-2),
-            selective_normalize_input=model_cfg.get('slinoss_normalize_input', True),
-            selective_use_triton=model_cfg.get(
-                'slinoss_use_triton', model_cfg.get('linoss_use_triton', False)
-            ),
+            causal_conv=model_cfg.get("causal_conv", True),
         )
+
+    elif ssm == 's5':
+        ssm = S5(
+            width=expand * d_model,
+            state_width=d_state,
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get("causal_conv", True),
+        )
+
     else:
         raise ValueError(
-            f"Unknown mixer {mixer_name!r}; expected 'mamba', 'linoss', or "
+            f"Unknown mixer {ssm!r}; expected 'mamba', 'linoss', or "
             "'selective_linoss'."
         )
 

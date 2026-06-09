@@ -24,6 +24,11 @@ import librosa
 import soundfile as sf
 import torch
 
+from dataloaders.dataloader_vctk import (
+    _common_root,
+    extract_identifier,
+    get_clean_path_for_noisy,
+)
 from models.generator import SEMamba
 from models.stfts import mag_phase_istft, mag_phase_stft
 from utils.metrics import Evaluator
@@ -93,14 +98,19 @@ def build_pair_list(cfg: dict, test_clean_json: str | None, test_noisy_json: str
     with open(noisy_json) as f:
         noisy_paths = json.load(f)
 
-    clean_by_name = {os.path.basename(p): p for p in clean_paths}
+    # Pair clean/noisy with the same dataset-relative, SNR-suffix-stripped key the
+    # training dataloader uses, so VCTK-DEMAND (identical basenames) and EARS-WHAM
+    # (per-speaker dirs + "_<snr>dB" suffix) both match correctly.
+    clean_root = _common_root(clean_paths)
+    noisy_root = _common_root(noisy_paths)
+    clean_by_id = {extract_identifier(p, clean_root): p for p in clean_paths}
     # Sort by basename so the "fixed samples" subset is reproducible across runs.
     noisy_sorted = sorted(noisy_paths, key=os.path.basename)
 
     pairs = []
     missing = 0
     for noisy in noisy_sorted:
-        clean = clean_by_name.get(os.path.basename(noisy))
+        clean = get_clean_path_for_noisy(noisy, noisy_root, clean_by_id)
         if clean is None:
             missing += 1
             continue
