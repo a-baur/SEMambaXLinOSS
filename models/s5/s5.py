@@ -25,7 +25,14 @@ def binary_operator(
 
 
 def apply_ssm(
-    Lambda_bars: torch.Tensor, B_bars, C_tilde, D, input_sequence, state=None, bidir: bool = False
+    Lambda_bars: torch.Tensor,
+    B_bars,
+    C_tilde,
+    D,
+    input_sequence,
+    state=None,
+    bidir: bool = False,
+    conj_sym: bool = False,
 ):
     cinput_sequence = input_sequence.type(Lambda_bars.dtype)  # Cast to correct complex type
 
@@ -40,8 +47,6 @@ def apply_ssm(
         Lambda_bars = Lambda_bars.tile(input_sequence.shape[0], 1)
 
     if state is not None:
-        # Bu_elements = torch.cat(((state).unsqueeze(0), Bu_elements), dim=0)
-        # Lambda_bars = torch.cat((torch.ones_like(state.unsqueeze(0)), Lambda_bars), dim=0)
         # Manually compute first step (Lambda_bar=1 so no change)
         Bu_elements[0] = Bu_elements[0] + state * Lambda_bars[0]
 
@@ -52,13 +57,22 @@ def apply_ssm(
         xs = torch.cat((xs, xs2), axis=-1)
 
     Du = torch.vmap(lambda u: D * u)(input_sequence)
-    return torch.vmap(lambda x: (C_tilde @ x).real)(xs) + Du, xs[
-        -1
-    ]  # torch.stack((_[-1], xs[-1]))
+    ys = torch.vmap(lambda x: C_tilde @ x)(xs)
+    # Conjugate symmetry: only half of each conjugate eigen-pair is stored, so the
+    # dropped half is reconstructed by doubling the real part (lindermanlab/S5).
+    ys = (2 * ys.real) if conj_sym else ys.real
+    return ys + Du, xs[-1]
 
 
 def apply_ssm_liquid(
-    Lambda_bars, B_bars, C_tilde, D, input_sequence, state=None, bidir: bool = False
+    Lambda_bars,
+    B_bars,
+    C_tilde,
+    D,
+    input_sequence,
+    state=None,
+    bidir: bool = False,
+    conj_sym: bool = False,
 ):
     """Liquid time constant SSM \u00e1 la dynamical systems given in Eq. 8 of
     https://arxiv.org/abs/2209.12951"""
@@ -85,7 +99,9 @@ def apply_ssm_liquid(
         xs = torch.cat((xs, xs2), axis=-1)
 
     Du = torch.vmap(lambda u: D * u)(input_sequence)
-    return torch.vmap(lambda x: (C_tilde @ x).real)(xs) + Du, xs[-1]
+    ys = torch.vmap(lambda x: C_tilde @ x)(xs)
+    ys = (2 * ys.real) if conj_sym else ys.real
+    return ys + Du, xs[-1]
 
 
 # Discretization functions
@@ -149,6 +165,8 @@ class S5SSM(torch.nn.Module):
         bcInit: Initialization = "factorized",
         degree: int = 1,
         bidir: bool = False,
+        conj_sym: bool = True,
+        clip_eigs: bool = False,
     ):
         """The S5 SSM
         Args:
@@ -177,26 +195,35 @@ class S5SSM(torch.nn.Module):
                                     on a different resolution for the speech commands benchmark
         """
         super().__init__()
-        self.Lambda = torch.nn.Parameter(lambdaInit)
+        # Lambda is parameterized by its real/imaginary parts separately (as in the
+        # original S5) so that clip_eigs can constrain the real part for stability.
+        self.Lambda_re = torch.nn.Parameter(lambdaInit.real.contiguous())
+        self.Lambda_im = torch.nn.Parameter(lambdaInit.imag.contiguous())
+        self.clip_eigs = clip_eigs
+        self.conj_sym = conj_sym
         self.degree = degree
         self.liquid = liquid
         self.bcInit = bcInit
         self.bidir = bidir
-        # TODO:
-        # if self.clip_eigs:
-        #    self.Lambda = np.clip(self.Lambda_re, None, -1e-4) + 1j * self.Lambda_im
 
         # the P-dim of C can needs to be 2P for bidir
         cp = p
         if self.bidir:
             cp *= 2
 
+        # Under conjugate symmetry the eigenvectors V/Vinv are rectangular
+        # (2P x P) / (P x 2P): B and C are sampled at the full size local_P=2P and
+        # projected down to the reduced latent size P (matches lindermanlab/S5).
+        local_P = 2 * p if self.conj_sym else p
+
         match bcInit:
             case "complex_normal":
                 self.C = torch.nn.Parameter(
                     torch.normal(0, 0.5**0.5, (h, cp), dtype=torch.complex64)
                 )
-                self.B = torch.nn.Parameter(init_VinvB(lecun_normal(), Vinv)((p, h), torch.float))
+                self.B = torch.nn.Parameter(
+                    init_VinvB(lecun_normal(), Vinv)((local_P, h), torch.float)
+                )
             case "dense_columns" | "dense":
                 if bcInit == "dense_columns":
                     B_eigen_init = init_columnwise_VinvB
@@ -206,13 +233,14 @@ class S5SSM(torch.nn.Module):
                     B_eigen_init = init_VinvB
                     B_init = C_init = lecun_normal()
                 # TODO: make init_*VinvB all a the same interface
-                self.B = torch.nn.Parameter(B_eigen_init(B_init, Vinv)((p, h), torch.float))
+                self.B = torch.nn.Parameter(B_eigen_init(B_init, Vinv)((local_P, h), torch.float))
                 if self.bidir:
                     C = torch.cat(
-                        [init_CV(C_init, (h, p), V), init_CV(C_init, (h, p), V)], axis=-1
+                        [init_CV(C_init, (h, local_P), V), init_CV(C_init, (h, local_P), V)],
+                        axis=-1,
                     )
                 else:
-                    C = init_CV(C_init, (h, p), V)
+                    C = init_CV(C_init, (h, local_P), V)
                 self.C = torch.nn.Parameter(C)
             case "factorized":
                 print(
@@ -249,9 +277,16 @@ class S5SSM(torch.nn.Module):
             case _:
                 raise ValueError(f"Unknown discretization {discretization}")
 
+    def get_Lambda(self):
+        """Reconstruct the complex diagonal state matrix from its real/imaginary
+        parts, optionally clamping the real part to keep eigenvalues in the
+        left-half plane (|Lambda_bar| < 1) for guaranteed stability."""
+        Lambda_re = torch.clamp(self.Lambda_re, max=-1e-4) if self.clip_eigs else self.Lambda_re
+        return torch.complex(Lambda_re, self.Lambda_im)
+
     def initial_state(self, batch_size: Optional[int]):
         batch_shape = (batch_size,) if batch_size is not None else ()
-        return torch.zeros((*batch_shape, self.C_tilde.shape[-2]))
+        return torch.zeros((*batch_shape, self.Lambda_re.shape[-1]), dtype=torch.complex64)
 
     def get_BC_tilde(self):
         match self.bcInit:
@@ -267,7 +302,7 @@ class S5SSM(torch.nn.Module):
         assert not self.bidir, "Can't use bidirectional when manually stepping"
         B_tilde, C_tilde = self.get_BC_tilde()
         step = step_scale * torch.exp(self.log_step)
-        Lambda_bar, B_bar = self.discretize(self.Lambda, B_tilde, step)
+        Lambda_bar, B_bar = self.discretize(self.get_Lambda(), B_tilde, step)
         if self.degree != 1:
             assert B_bar.shape[-2] == B_bar.shape[-1], (
                 "higher-order input operators must be full-rank"
@@ -280,7 +315,8 @@ class S5SSM(torch.nn.Module):
             Lambda_bar += Bu
         # https://arxiv.org/abs/2208.04933v2, Eq. 2
         x = Lambda_bar * prev_state + Bu
-        y = (C_tilde @ x + self.D * signal).real
+        Cx = C_tilde @ x
+        y = (2 * Cx.real if self.conj_sym else Cx.real) + self.D * signal
         return y, x
 
     def forward(
@@ -294,10 +330,7 @@ class S5SSM(torch.nn.Module):
             # TODO: This is very expensive due to individual steps being multiplied by B_tilde in self.discretize
             step = step_scale[:, None] * torch.exp(self.log_step)
 
-        # print(f'{self.Lambda.shape=} {B_tilde.shape=} {step.shape=}')
-        # Lambda_bars, B_bars = torch.vmap(lambda s: self.discretize(self.Lambda, B_tilde, s))(step)
-        # print(Lambda_bars.shape, B_bars.shape)
-        Lambda_bars, B_bars = self.discretize(self.Lambda, B_tilde, step)
+        Lambda_bars, B_bars = self.discretize(self.get_Lambda(), B_tilde, step)
         if self.degree != 1:
             assert B_bars.shape[-2] == B_bars.shape[-1], (
                 "higher-order input operators must be full-rank"
@@ -310,7 +343,14 @@ class S5SSM(torch.nn.Module):
 
         forward = apply_ssm_liquid if self.liquid else apply_ssm
         out, state = forward(
-            Lambda_bars, B_bars, C_tilde, self.D, signal, state=state, bidir=self.bidir
+            Lambda_bars,
+            B_bars,
+            C_tilde,
+            self.D,
+            signal,
+            state=state,
+            bidir=self.bidir,
+            conj_sym=self.conj_sym,
         )
         # NOTE: technically it could work in a limited sense; taking the first and last element
         #   but that wouldn't be equivalent to running bidir on full sequences.
@@ -336,6 +376,8 @@ class S5(torch.nn.Module):
         liquid: bool = False,
         degree: int = 1,
         bidir: bool = False,
+        conj_sym: bool = True,
+        clip_eigs: bool = False,
         bcInit: Optional[Initialization] = None,
     ):
         super().__init__()
@@ -344,16 +386,27 @@ class S5(torch.nn.Module):
 
         block_size = state_width // block_count
         Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
+
+        # Conjugate symmetry: the HiPPO eigenvalues come in conjugate pairs, so we
+        # keep only the first half and reconstruct the dropped conjugate half at the
+        # output via 2*Re(C x) (see apply_ssm). Mirrors lindermanlab/S5 and
+        # tk-rusch/linoss, where Vinv is formed from the trimmed eigenvectors.
+        if conj_sym:
+            block_size = block_size // 2
+            Lambda = Lambda[:block_size]
+            V = V[:, :block_size]
         Vinv = V.conj().T
+
         Lambda, B, V, B_orig, Vinv = map(
             lambda v: torch.tensor(v, dtype=torch.complex64), (Lambda, B, V, B_orig, Vinv)
         )
         if block_count > 1:
-            Lambda = Lambda[:block_size]
-            V = V[:, :block_size]
             Lambda = (Lambda * torch.ones((block_count, block_size))).ravel()
             V = torch.block_diag(*([V] * block_count))
             Vinv = torch.block_diag(*([Vinv] * block_count))
+
+        # Latent state size after conjugate-symmetry trimming and block tiling.
+        state_size = int(Lambda.shape[0])
 
         assert bool(factor_rank) != bool(bcInit != "factorized"), (
             "Can't have `bcInit != factorized` and `factor_rank` defined"
@@ -365,7 +418,7 @@ class S5(torch.nn.Module):
             V,
             Vinv,
             width,
-            state_width,
+            state_size,
             dt_min,
             dt_max,
             factor_rank=factor_rank,
@@ -373,6 +426,8 @@ class S5(torch.nn.Module):
             liquid=liquid,
             degree=degree,
             bidir=bidir,
+            conj_sym=conj_sym,
+            clip_eigs=clip_eigs,
         )
 
     def initial_state(self, batch_size: Optional[int] = None):

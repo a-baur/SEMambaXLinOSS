@@ -5,6 +5,36 @@ import shutil
 import glob
 from torch.distributed import init_process_group
 
+def get_cuda_devices() -> list[str]:
+    """Get list of cuda devices available for training."""
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    n_gpus = torch.cuda.device_count()
+    if cuda_visible_devices is not None:
+        gpu_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        gpu_ids = list(range(n_gpus))
+
+    device_info = []
+    for idx, i in zip(gpu_ids, range(n_gpus)):
+        name = torch.cuda.get_device_name(i)
+        mem_free, mem_total = torch.cuda.mem_get_info(i)
+        mem_free, mem_total = mem_free / 1024 ** 3, mem_total / 1024 ** 3
+        mem_usage = mem_total - mem_free
+        percent = mem_usage / mem_total
+        info = f"{name} [gpu:{idx} | cuda:{i} | utilization: {percent:7.2%} ({mem_usage:4.1f}GB/{mem_total:4.1f}GB)]"
+        device_info.append(info)
+
+    return device_info
+
+def print_gpu_info(cfg):
+    n_gpus = torch.cuda.device_count()
+
+    if n_gpus > 0:
+        devices = get_cuda_devices()
+        devices = "\n".join(devices)
+        print(f"Starting training on\n{devices}\n")
+        print("Batch size per GPU:", int(cfg["training_cfg"]["batch_size"] / n_gpus))
+
 def load_config(config_path):
     """Load configuration from a YAML file."""
     with open(config_path, 'r') as file:
@@ -15,13 +45,6 @@ def initialize_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-
-def print_gpu_info(num_gpus, cfg):
-    """Print information about available GPUs and batch size per GPU."""
-    for i in range(num_gpus):
-        gpu_name = torch.cuda.get_device_name(i)
-        print(f"GPU {i}: {gpu_name}")
-        print('Batch size per GPU:', int(cfg['training_cfg']['batch_size'] / num_gpus))
 
 def initialize_process_group(cfg, rank):
     """Initialize the process group for distributed training."""

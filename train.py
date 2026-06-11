@@ -21,6 +21,8 @@ from models.loss import phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
 from models.linoss.linoss import LinOSS
 from models.linoss.selective_linoss import MambOSS
+from models.linoss.mamboss6 import MambOSS6
+from models.s5.s5 import S5SSM
 from utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
     build_env, load_config, initialize_seed,
@@ -52,6 +54,29 @@ def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=
                 if proj.bias is not None and proj.bias.requires_grad:
                     ssm_params.append(proj.bias)
                     ssm_param_ids.add(id(proj.bias))
+        elif isinstance(module, MambOSS6):
+            # Static per-(channel, mode) dynamics A_log/omega and the two time-step
+            # baselines (dt_*_up.bias) are the LTI analog of LinOSS's A_diag/G_diag/steps
+            # — low SSM LR, no weight decay. The low-rank selective projection weights
+            # *are* the input-dependence and stay at the base LR (like MambOSS's W_nu/W_theta).
+            for attr in ["A_log", "omega"]:
+                param = getattr(module, attr, None)
+                if param is not None and param.requires_grad:
+                    ssm_params.append(param)
+                    ssm_param_ids.add(id(param))
+            for proj in [module.dt_nu_up, module.dt_theta_up]:
+                if proj.bias is not None and proj.bias.requires_grad:
+                    ssm_params.append(proj.bias)
+                    ssm_param_ids.add(id(proj.bias))
+        elif isinstance(module, S5SSM):
+            # S5's continuous-time dynamics (eigenvalues Lambda_re/Lambda_im and the
+            # per-mode timescales log_step) are the analog of LinOSS's A_diag/G_diag/steps:
+            # the original S5 trains them at a reduced "ssm_lr" with no weight decay.
+            for attr in ["Lambda_re", "Lambda_im", "log_step"]:
+                param = getattr(module, attr, None)
+                if param is not None and param.requires_grad:
+                    ssm_params.append(param)
+                    ssm_param_ids.add(id(param))
 
     for param in model.parameters():
         if param.requires_grad and id(param) not in ssm_param_ids:
@@ -338,7 +363,8 @@ def train(rank, args, cfg):
                         "UTMOS Score": 0,
                     }
 
-                    num_viz_samples = cfg['env_setting'].get('num_viz_samples', 3)
+                    num_viz_samples = cfg['env_setting'].get('num_viz_samples', 5)
+                    viz_max_seconds = cfg['env_setting'].get('viz_max_seconds', 5.0)
 
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
@@ -364,6 +390,7 @@ def train(rank, args, cfg):
                                     sw, j, steps, cfg['stft_cfg']['sampling_rate'], hop_size, compress_factor,
                                     clean_audio, noisy_audio, audio_g,
                                     clean_mag, noisy_mag, mag_g,
+                                    max_seconds=viz_max_seconds,
                                 )
 
                             val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg)
@@ -407,8 +434,8 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='Mamba_EARS')
-    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/Custom/latest.yaml')
+    parser.add_argument('--exp_name', default='MambOSS6_EARS')
+    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/latest.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -431,9 +458,7 @@ def main():
     build_env(args.config, 'config.yaml', args.exp_path)
 
     if torch.cuda.is_available():
-        num_available_gpus = torch.cuda.device_count()
-        print(f"Number of GPUs available: {num_available_gpus}")
-        print_gpu_info(num_available_gpus, cfg)
+        print_gpu_info(cfg)
     else:
         print("CUDA is not available.")
 

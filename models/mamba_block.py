@@ -12,6 +12,7 @@ from mamba_ssm.ops.triton.layernorm import RMSNorm
 
 from models.linoss.linoss import LinOSS
 from models.linoss.selective_linoss import MambOSS
+from models.linoss.mamboss6 import MambOSS6
 from models.mixer import MambaStyleMixer
 from models.s5.s5 import S5
 
@@ -73,10 +74,36 @@ def create_block(
             causal_conv=model_cfg.get("causal_conv", True),
         )
 
+    elif ssm == 'mamboss6':
+        ssm = MambOSS6(
+            in_features=expand * d_model,
+            state_dim=d_state,
+            dt_rank=ssm_params.get('dt_rank', None),
+            dt_min=ssm_params.get('dt_min', 1e-3),
+            dt_max=ssm_params.get('dt_max', 0.1),
+            theta_max=ssm_params.get('theta_max', math.pi),
+            selective_init_std=ssm_params.get('init_std', 1e-2),
+            use_triton=ssm_params.get('use_triton', False),
+            chunk_size=ssm_params.get('chunk_size', 16),
+            block_c=ssm_params.get('block_c', 32),
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get("causal_conv", True),
+        )
+
     elif ssm == 's5':
         ssm = S5(
             width=expand * d_model,
             state_width=d_state,
+            conj_sym=ssm_params.get("conj_sym", True),
+            clip_eigs=ssm_params.get("clip_eigs", False),
+            block_count=ssm_params.get("block_count", 1),
+            dt_min=ssm_params.get("dt_min", 0.001),
+            dt_max=ssm_params.get("dt_max", 0.1),
         )
         mixer_cls = partial(
             MambaStyleMixer,
@@ -88,8 +115,8 @@ def create_block(
 
     else:
         raise ValueError(
-            f"Unknown mixer {ssm!r}; expected 'mamba', 'linoss', or "
-            "'selective_linoss'."
+            f"Unknown mixer {ssm!r}; expected 'mamba', 'linoss', "
+            "'selective_linoss', 'mamboss6', or 's5'."
         )
 
     norm_cls = partial(
