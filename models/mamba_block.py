@@ -15,6 +15,7 @@ from models.linoss.selective_linoss import MambOSS
 from models.linoss.mamboss6 import MambOSS6
 from models.mixer import MambaStyleMixer
 from models.s5.s5 import S5
+from models.s4d.s4d import S4DCore
 
 
 # github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
@@ -113,10 +114,25 @@ def create_block(
             causal_conv=model_cfg.get("causal_conv", True),
         )
 
+    elif ssm == 's4d':
+        ssm = S4DCore(
+            d_model=expand * d_model,
+            d_state=d_state,
+            dt_min=ssm_params.get("dt_min", 1e-3),
+            dt_max=ssm_params.get("dt_max", 0.1),
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get("causal_conv", True),
+        )
+
     else:
         raise ValueError(
             f"Unknown mixer {ssm!r}; expected 'mamba', 'linoss', "
-            "'selective_linoss', 'mamboss6', or 's5'."
+            "'selective_linoss', 'mamboss6', 's4d', or 's5'."
         )
 
     norm_cls = partial(

@@ -23,6 +23,7 @@ from models.linoss.linoss import LinOSS
 from models.linoss.selective_linoss import MambOSS
 from models.linoss.mamboss6 import MambOSS6
 from models.s5.s5 import S5SSM
+from models.s4d.s4d import S4DKernel
 from utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
     build_env, load_config, initialize_seed,
@@ -73,6 +74,16 @@ def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=
             # per-mode timescales log_step) are the analog of LinOSS's A_diag/G_diag/steps:
             # the original S5 trains them at a reduced "ssm_lr" with no weight decay.
             for attr in ["Lambda_re", "Lambda_im", "log_step"]:
+                param = getattr(module, attr, None)
+                if param is not None and param.requires_grad:
+                    ssm_params.append(param)
+                    ssm_param_ids.add(id(param))
+        elif isinstance(module, S4DKernel):
+            # S4D's continuous-time diagonal dynamics (per-mode timescales log_dt and
+            # the diagonal A eigenvalues log_A_real/A_imag) are the analog of LinOSS's
+            # A_diag/G_diag/steps: the original S4D trains them at a reduced lr with no
+            # weight decay. The C readout and the D skip (S4DCore.D) stay at the base LR.
+            for attr in ["log_dt", "log_A_real", "A_imag"]:
                 param = getattr(module, attr, None)
                 if param is not None and param.requires_grad:
                     ssm_params.append(param)

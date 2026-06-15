@@ -57,21 +57,16 @@ model_cfg:
   hid_feature: 64  # Channels in dense layers.
   compress_factor: 0.3  # Compression factor applied to extracted features.
   num_tfmamba: 4  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
-  d_state: 256  # Dimensionality of the state vector in Mamba blocks.
-  d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
-  expand: 2  # Expansion factor for the layers within the Mamba blocks.
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement
-  # Sequence mixer selection. When 's5', the keys under ssm_params configure the
-  # inner S5 SSM; d_state above is reused as the S5 latent size (state_width) and
-  # expand/d_conv configure the surrounding Mamba-style block.
+
   causal_conv: true      # causal depthwise conv before the SSM
-  ssm: s5
+  ssm: s4d   # or set ssm: s4d depending on your config key
+  d_state: 256
+  d_conv: 4
+  expand: 2
   ssm_params:
-    conj_sym: true        # exploit HiPPO conjugate symmetry (halves latent state, output 2*Re(Cx))
-    clip_eigs: false      # clamp Re(Lambda) <= -1e-4 for a guaranteed-stable recurrence
-    block_count: 1        # number of HiPPO-DPLR diagonal blocks tiled into the state
-    dt_min: 0.001         # min timescale for the learnable log-step init
-    dt_max: 0.1           # max timescale for the learnable log-step init
+    dt_min: 0.001
+    dt_max: 0.1

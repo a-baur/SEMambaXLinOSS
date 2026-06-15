@@ -1,3 +1,6 @@
+"""
+Reference: https://github.com/i404788/s5-pytorch/blob/master/s5/s5_model.py
+"""
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional, Literal
