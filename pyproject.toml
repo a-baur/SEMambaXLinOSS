@@ -25,6 +25,10 @@ dependencies = [
     "auraloss>=0.4.0",
     "torchmetrics>=1.9.0",
     "matplotlib>=3.10.9",
+    "distillmos>=0.9.1",
+    "scoreq>=1.0.1",
+    "wvmos>=1.0",
+    "pystoi>=0.4.1",
 ]
 
 [project.optional-dependencies]
@@ -76,6 +80,9 @@ pythonpath = ["src"]
 
 [tool.uv]
 no-build-isolation-package = ["mamba-ssm"]
+# scoreq declares numpy>=2.0 but its ONNX no-reference path runs fine on the
+# project-pinned numpy 1.26.4; force the pin to avoid a resolver conflict.
+override-dependencies = ["numpy==1.26.4"]
 
 [tool.uv.extra-build-dependencies]
 mamba-ssm = ["wheel", "torch>=2.4.0", "packaging>=26.2", "setuptools==70.1"]

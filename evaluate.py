@@ -162,7 +162,16 @@ def main():
     os.makedirs(samples_dir, exist_ok=True)
     sample_indices = set(range(min(args.num_samples, len(pairs))))
 
-    metric_names = ("pesq", "mrstft", "utmos")
+    metric_names = (
+        "pesq",
+        "mrstft",
+        "utmos",
+        "distillmos",
+        "nisqa",
+        "sisdr",
+        "lsd",
+        "estoi",
+    )
     sums = {m: 0.0 for m in metric_names}
     counts = {m: 0 for m in metric_names}
     per_utt = []
@@ -188,6 +197,11 @@ def main():
             "pesq": pesq,
             "mrstft": metrics.mrstft,
             "utmos": metrics.utmos,
+            "distillmos": metrics.distillmos,
+            "nisqa": metrics.nisqa,
+            "sisdr": metrics.sisdr,
+            "lsd": metrics.lsd,
+            "estoi": metrics.estoi,
         }
         per_utt.append(row)
         for m in metric_names:
@@ -219,12 +233,8 @@ def main():
 
         if (i + 1) % 50 == 0:
             running = {m: sums[m] / max(counts[m], 1) for m in metric_names}
-            print(
-                f"  [{i + 1}/{len(pairs)}] "
-                f"PESQ={running['pesq']:.4f}  "
-                f"MR-STFT={running['mrstft']:.4f}  "
-                f"UTMOS={running['utmos']:.4f}"
-            )
+            stats = "  ".join(f"{m.upper()}={running[m]:.4f}" for m in metric_names)
+            print(f"  [{i + 1}/{len(pairs)}] {stats}")
 
     means = {m: sums[m] / max(counts[m], 1) for m in metric_names}
     summary = {
@@ -236,6 +246,11 @@ def main():
         "mean_pesq": means["pesq"],
         "mean_mrstft": means["mrstft"],
         "mean_utmos": means["utmos"],
+        "mean_distillmos": means["distillmos"],
+        "mean_nisqa": means["nisqa"],
+        "mean_sisdr": means["sisdr"],
+        "mean_lsd": means["lsd"],
+        "mean_estoi": means["estoi"],
         "samples_dir": samples_dir,
     }
     out_json = os.path.join(args.output_dir, "metrics.json")
@@ -243,9 +258,21 @@ def main():
         json.dump({"summary": summary, "per_utterance": per_utt}, f, indent=2)
 
     print()
-    print(f"Mean PESQ    : {means['pesq']:.4f} over {counts['pesq']}/{len(pairs)} utts")
-    print(f"Mean MR-STFT : {means['mrstft']:.4f} over {counts['mrstft']}/{len(pairs)} utts")
-    print(f"Mean UTMOS   : {means['utmos']:.4f} over {counts['utmos']}/{len(pairs)} utts")
+    labels = {
+        "pesq": "PESQ",
+        "mrstft": "MR-STFT",
+        "utmos": "UTMOS",
+        "distillmos": "DistillMOS",
+        "nisqa": "NISQA",
+        "sisdr": "SI-SDR",
+        "lsd": "LSD",
+        "estoi": "ESTOI",
+    }
+    for m in metric_names:
+        print(
+            f"Mean {labels[m]:<10}: {means[m]:.4f} "
+            f"over {counts[m]}/{len(pairs)} utts"
+        )
     print(f"Samples      : {samples_dir} ({len(sample_indices)} clips)")
     print(f"Per-utt log  : {out_json}")
 

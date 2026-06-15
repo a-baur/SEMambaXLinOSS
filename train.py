@@ -361,6 +361,9 @@ def train(rank, args, cfg):
                         "PESQ Score": 0,
                         "MultiResSTFT Loss": 0,
                         "UTMOS Score": 0,
+                        "DistillMOS Score": 0,
+                        "SI-SDR": 0,
+                        "LSD": 0,
                     }
 
                     num_viz_samples = cfg['env_setting'].get('num_viz_samples', 5)
@@ -381,7 +384,12 @@ def train(rank, args, cfg):
                             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
 
                             min_len = min(clean_audio.size(-1), audio_g.size(-1))
-                            metrics = evaluator.compute(clean_audio[..., :min_len], audio_g[..., :min_len])
+                            # Skip the CPU-bound NISQA/ESTOI here; evaluate.py still
+                            # reports them. Keeps in-training validation off the CPU.
+                            metrics = evaluator.compute(
+                                clean_audio[..., :min_len], audio_g[..., :min_len],
+                                exclude=("nisqa", "estoi"),
+                            )
 
                             # Log a handful of example waveforms / spectrograms to TensorBoard
                             if j < num_viz_samples:
@@ -400,6 +408,9 @@ def train(rank, args, cfg):
                             val_metrics["PESQ Score"] += metrics.pesq
                             val_metrics["MultiResSTFT Loss"] += metrics.mrstft
                             val_metrics["UTMOS Score"] += metrics.utmos
+                            val_metrics["DistillMOS Score"] += metrics.distillmos
+                            val_metrics["SI-SDR"] += metrics.sisdr
+                            val_metrics["LSD"] += metrics.lsd
 
                         log_str = f"VALIDATION"
                         for metric, scores in val_metrics.items():
@@ -421,7 +432,6 @@ def train(rank, args, cfg):
                         print(log_str)
                     generator.train()
 
-
             steps += 1
 
         scheduler_g.step()
@@ -434,8 +444,8 @@ def train(rank, args, cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='MambOSS6_EARS')
-    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/latest.yaml')
+    parser.add_argument('--exp_name', default='MambOSS_MBank_EARS')
+    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/selective/MambOSS.yaml')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
