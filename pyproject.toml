@@ -29,6 +29,7 @@ dependencies = [
     "scoreq>=1.0.1",
     "wvmos>=1.0",
     "pystoi>=0.4.1",
+    "wandb>=0.18.0",
 ]
 
 [project.optional-dependencies]

@@ -7,6 +7,7 @@ import os
 import time
 import argparse
 import torch
+import wandb
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -32,6 +33,10 @@ from utils.util import (
 from utils.metrics import Evaluator
 
 torch.backends.cudnn.benchmark = True
+# Enable TF32 for float32 matmuls/convs on Ampere+ (faster, negligible quality impact).
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=(0.9, 0.999), weight_decay=1e-2):
@@ -224,6 +229,8 @@ def train(rank, args, cfg):
     if rank == 0:
         validset = create_dataset(cfg, train=False, split=False, device=device)
         validation_loader = create_dataloader(validset, cfg, train=False)
+        wandb.init(project="SEMambaXLinOSS", name=args.exp_name, dir=args.exp_path,
+                   config=cfg, sync_tensorboard=True)
         sw = SummaryWriter(os.path.join(args.exp_path, 'logs'))
 
     generator.train()
@@ -450,6 +457,10 @@ def train(rank, args, cfg):
 
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+
+    if rank == 0:
+        sw.close()
+        wandb.finish()
 
 # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
 def main():
