@@ -64,7 +64,7 @@ model_cfg:
 
   causal_conv: true      # causal depthwise conv before the SSM
   ssm: s4d   # or set ssm: s4d depending on your config key
-  d_state: 256
+  d_state: 128
   d_conv: 4
   expand: 2
   ssm_params:

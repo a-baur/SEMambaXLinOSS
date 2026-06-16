@@ -69,33 +69,3 @@ model_cfg:
   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
   expand: 4  # Expansion factor for the layers within the Mamba blocks.
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
-  causal_conv: true      # causal depthwise conv before the SSM
-  ssm_params:
-    discretization: IMEX   # 'IM' or 'IMEX'
-    damping: true          # damped IMEX (ignored when discretization='IM')
-    r_min: 0.9             # initialization radius lower bound
-    theta_max: 3.141592653589793  # initialization angle upper bound (pi)
-    use_triton: true      # enable the Triton-accelerated LinOSS scan kernel
-
-
-  # # Mixer for time blocks
-  # freq_mixer:
-  #   mixer: mamba
-  #   d_state: 16  # Dimensionality of the state vector in Mamba blocks.
-  #   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
-  #   expand: 4  # Expansion factor for the layers within the Mamba blocks.
-  #   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
-
-  # # Mixer for frequency blocks
-  # time_mixer:
-  #   mixer: linoss
-  #   d_state: 16  # Dimensionality of the state vector in Mamba blocks.
-  #   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
-  #   expand: 4  # Expansion factor for the layers within the Mamba blocks.
-  #   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
-  #   linoss_discretization: IMEX   # 'IM' or 'IMEX'
-  #   linoss_damping: true          # damped IMEX (ignored when discretization='IM')
-  #   linoss_r_min: 0.9             # initialization radius lower bound
-  #   linoss_theta_max: 3.141592653589793  # initialization angle upper bound (pi)
-  #   linoss_causal_conv: true      # causal depthwise conv before the SSM
-  #   linoss_use_triton: true      # enable the Triton-accelerated LinOSS scan kernel
