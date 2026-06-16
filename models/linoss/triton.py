@@ -11,8 +11,19 @@ giving
 
 Triton has no native complex64. The transition M is real, so the real and
 imaginary halves of (y1, y2, F1, F2) evolve under identical dynamics
-independently — we stack them along the batch axis (2B sequences) and
-run a single real-valued kernel.
+independently. Rather than materializing a stacked (2B, T, N) real tensor, we
+pass the complex inputs as their `view_as_real` (B, T, N, 2) views and let each
+program carry *both* halves through the scan in registers — one program per
+sequence instead of two. This avoids the cat/complex host-side copies, halves
+the launch grid, and halves the reduction traffic into dM.
+
+The per-mode dM reduction is the shared-parameter gradient
+`dM_ij = Σ_b Σ_t g_t[i]·s_{t-1}[j]`. Rather than `tl.atomic_add` into a shared
+`(N,)` buffer, each program writes its own `(B, N)` partial via a pure `tl.store`
+(every slot written exactly once) and the partials are reduced with an external
+`.sum(0)`. The deterministic tree-sum is slightly *more* accurate than the
+nondeterministic atomic on large folded batches, and is CUDA-graph-safe (no
+buffer is accumulated-into across replays).
 """
 
 from __future__ import annotations
@@ -28,7 +39,7 @@ def _linoss_scan_fwd_kernel(
     F1_ptr, F2_ptr,
     Y1_ptr, Y2_ptr,
     T, N,
-    stride_b, stride_t, stride_n,
+    stride_b, stride_t, stride_n, stride_c,
     BLOCK_N: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -42,21 +53,34 @@ def _linoss_scan_fwd_kernel(
     M_21 = tl.load(M_21_ptr + offs_n, mask=mask_n, other=0.0)
     M_22 = tl.load(M_22_ptr + offs_n, mask=mask_n, other=0.0)
 
-    y1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    y2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    y1_re = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    y1_im = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    y2_re = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    y2_im = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     base = pid_b * stride_b + offs_n * stride_n
 
     for t in range(T):
         offs_t = base + t * stride_t
-        f1 = tl.load(F1_ptr + offs_t, mask=mask_n, other=0.0)
-        f2 = tl.load(F2_ptr + offs_t, mask=mask_n, other=0.0)
-        new_y1 = M_11 * y1 + M_12 * y2 + f1
-        new_y2 = M_21 * y1 + M_22 * y2 + f2
-        y1 = new_y1
-        y2 = new_y2
-        tl.store(Y1_ptr + offs_t, y1, mask=mask_n)
-        tl.store(Y2_ptr + offs_t, y2, mask=mask_n)
+        f1_re = tl.load(F1_ptr + offs_t, mask=mask_n, other=0.0)
+        f1_im = tl.load(F1_ptr + offs_t + stride_c, mask=mask_n, other=0.0)
+        f2_re = tl.load(F2_ptr + offs_t, mask=mask_n, other=0.0)
+        f2_im = tl.load(F2_ptr + offs_t + stride_c, mask=mask_n, other=0.0)
+
+        new_y1_re = M_11 * y1_re + M_12 * y2_re + f1_re
+        new_y1_im = M_11 * y1_im + M_12 * y2_im + f1_im
+        new_y2_re = M_21 * y1_re + M_22 * y2_re + f2_re
+        new_y2_im = M_21 * y1_im + M_22 * y2_im + f2_im
+
+        y1_re = new_y1_re
+        y1_im = new_y1_im
+        y2_re = new_y2_re
+        y2_im = new_y2_im
+
+        tl.store(Y1_ptr + offs_t, y1_re, mask=mask_n)
+        tl.store(Y1_ptr + offs_t + stride_c, y1_im, mask=mask_n)
+        tl.store(Y2_ptr + offs_t, y2_re, mask=mask_n)
+        tl.store(Y2_ptr + offs_t + stride_c, y2_im, mask=mask_n)
 
 
 @triton.jit
@@ -64,9 +88,9 @@ def _linoss_scan_bwd_kernel(
     M_11_ptr, M_12_ptr, M_21_ptr, M_22_ptr,
     Y1_ptr, Y2_ptr, dY2_ptr,
     dF1_ptr, dF2_ptr,
-    dM_11_ptr, dM_12_ptr, dM_21_ptr, dM_22_ptr,
+    dM_11_ptr, dM_12_ptr, dM_21_ptr, dM_22_ptr,  # (B, N) per-batch-row partials
     T, N,
-    stride_b, stride_t, stride_n,
+    stride_b, stride_t, stride_n, stride_c,
     BLOCK_N: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -80,8 +104,10 @@ def _linoss_scan_bwd_kernel(
     M_21 = tl.load(M_21_ptr + offs_n, mask=mask_n, other=0.0)
     M_22 = tl.load(M_22_ptr + offs_n, mask=mask_n, other=0.0)
 
-    a1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    a2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    a1_re = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    a1_im = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    a2_re = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    a2_im = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     dM_11_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     dM_12_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -97,34 +123,54 @@ def _linoss_scan_bwd_kernel(
         offs_t = base + t * stride_t
         offs_tm1 = base + (t - 1) * stride_t
 
-        dy2 = tl.load(dY2_ptr + offs_t, mask=mask_n, other=0.0)
-        new_a1 = M_11 * a1 + M_21 * a2
-        new_a2 = dy2 + M_12 * a1 + M_22 * a2
+        dy2_re = tl.load(dY2_ptr + offs_t, mask=mask_n, other=0.0)
+        dy2_im = tl.load(dY2_ptr + offs_t + stride_c, mask=mask_n, other=0.0)
 
-        tl.store(dF1_ptr + offs_t, new_a1, mask=mask_n)
-        tl.store(dF2_ptr + offs_t, new_a2, mask=mask_n)
+        new_a1_re = M_11 * a1_re + M_21 * a2_re
+        new_a1_im = M_11 * a1_im + M_21 * a2_im
+        new_a2_re = dy2_re + M_12 * a1_re + M_22 * a2_re
+        new_a2_im = dy2_im + M_12 * a1_im + M_22 * a2_im
 
-        y1_prev = tl.load(Y1_ptr + offs_tm1, mask=mask_n, other=0.0)
-        y2_prev = tl.load(Y2_ptr + offs_tm1, mask=mask_n, other=0.0)
-        dM_11_acc += new_a1 * y1_prev
-        dM_12_acc += new_a1 * y2_prev
-        dM_21_acc += new_a2 * y1_prev
-        dM_22_acc += new_a2 * y2_prev
+        tl.store(dF1_ptr + offs_t, new_a1_re, mask=mask_n)
+        tl.store(dF1_ptr + offs_t + stride_c, new_a1_im, mask=mask_n)
+        tl.store(dF2_ptr + offs_t, new_a2_re, mask=mask_n)
+        tl.store(dF2_ptr + offs_t + stride_c, new_a2_im, mask=mask_n)
 
-        a1 = new_a1
-        a2 = new_a2
+        y1_prev_re = tl.load(Y1_ptr + offs_tm1, mask=mask_n, other=0.0)
+        y1_prev_im = tl.load(Y1_ptr + offs_tm1 + stride_c, mask=mask_n, other=0.0)
+        y2_prev_re = tl.load(Y2_ptr + offs_tm1, mask=mask_n, other=0.0)
+        y2_prev_im = tl.load(Y2_ptr + offs_tm1 + stride_c, mask=mask_n, other=0.0)
+
+        # Fold real + imag contributions into the per-program accumulator.
+        dM_11_acc += new_a1_re * y1_prev_re + new_a1_im * y1_prev_im
+        dM_12_acc += new_a1_re * y2_prev_re + new_a1_im * y2_prev_im
+        dM_21_acc += new_a2_re * y1_prev_re + new_a2_im * y1_prev_im
+        dM_22_acc += new_a2_re * y2_prev_re + new_a2_im * y2_prev_im
+
+        a1_re = new_a1_re
+        a1_im = new_a1_im
+        a2_re = new_a2_re
+        a2_im = new_a2_im
 
     # t = 0: s_{-1} = 0 contributes nothing to dM; just propagate dF.
-    dy2 = tl.load(dY2_ptr + base, mask=mask_n, other=0.0)
-    new_a1 = M_11 * a1 + M_21 * a2
-    new_a2 = dy2 + M_12 * a1 + M_22 * a2
-    tl.store(dF1_ptr + base, new_a1, mask=mask_n)
-    tl.store(dF2_ptr + base, new_a2, mask=mask_n)
+    dy2_re = tl.load(dY2_ptr + base, mask=mask_n, other=0.0)
+    dy2_im = tl.load(dY2_ptr + base + stride_c, mask=mask_n, other=0.0)
+    new_a1_re = M_11 * a1_re + M_21 * a2_re
+    new_a1_im = M_11 * a1_im + M_21 * a2_im
+    new_a2_re = dy2_re + M_12 * a1_re + M_22 * a2_re
+    new_a2_im = dy2_im + M_12 * a1_im + M_22 * a2_im
+    tl.store(dF1_ptr + base, new_a1_re, mask=mask_n)
+    tl.store(dF1_ptr + base + stride_c, new_a1_im, mask=mask_n)
+    tl.store(dF2_ptr + base, new_a2_re, mask=mask_n)
+    tl.store(dF2_ptr + base + stride_c, new_a2_im, mask=mask_n)
 
-    tl.atomic_add(dM_11_ptr + offs_n, dM_11_acc, mask=mask_n)
-    tl.atomic_add(dM_12_ptr + offs_n, dM_12_acc, mask=mask_n)
-    tl.atomic_add(dM_21_ptr + offs_n, dM_21_acc, mask=mask_n)
-    tl.atomic_add(dM_22_ptr + offs_n, dM_22_acc, mask=mask_n)
+    # Pure store of per-batch-row partials: slot (pid_b, offs_n), written once.
+    # No atomic -> CUDA-graph-safe; reduced by an external .sum(0).
+    part_off = pid_b * N + offs_n
+    tl.store(dM_11_ptr + part_off, dM_11_acc, mask=mask_n)
+    tl.store(dM_12_ptr + part_off, dM_12_acc, mask=mask_n)
+    tl.store(dM_21_ptr + part_off, dM_21_acc, mask=mask_n)
+    tl.store(dM_22_ptr + part_off, dM_22_acc, mask=mask_n)
 
 
 def _block_n_for(state_dim: int) -> int:
@@ -134,20 +180,43 @@ def _block_n_for(state_dim: int) -> int:
     return max(16, min(pow2, 64))
 
 
-def _complex_to_stacked(z: torch.Tensor) -> torch.Tensor:
-    # (B, T, N) complex -> (2B, T, N) real, [real-half ; imag-half] along batch.
-    return torch.cat([z.real.contiguous(), z.imag.contiguous()], dim=0)
+def _num_warps_for(block_n: int) -> int:
+    # One lane per state element; with block_n <= 64 a single warp covers 32
+    # lanes, so 1-2 warps suffice. Keeping programs small lets more of them stay
+    # resident to hide the sequential scan's memory latency.
+    return max(1, block_n // 32)
 
 
-def _stacked_to_complex(z: torch.Tensor, B: int) -> torch.Tensor:
-    return torch.complex(z[:B], z[B:])
+def _real_strides(T: int, N: int) -> tuple[int, int, int, int]:
+    # Element strides of a contiguous (B, T, N, 2) real view of (B, T, N) complex.
+    return (T * N * 2, N * 2, 2, 1)
 
 
 class LinOSSScanFunction(torch.autograd.Function):
+    """autograd.Function wrapping the partial-reduction Triton scan.
+
+    The backward computes the per-mode transition gradient
+    `dM_ij = Σ_b Σ_t g_t[i]·s_{t-1}[j]` (a reduction over the folded batch) by
+    having each program write its own `(B, N)` partial via a pure `tl.store`
+    (every slot written once) and reducing with an external `.sum(0)`, rather than
+    `tl.atomic_add` into a shared `(N,)` buffer. The deterministic tree-sum is
+    slightly more accurate than the nondeterministic atomic on large folded
+    batches, and — unlike an atomic into a replayed buffer — is CUDA-graph-safe.
+
+    The scan is exposed as an opaque autograd.Function (a `torch.compile` graph
+    break) rather than an in-graph `torch.library.triton_op`. The break is
+    load-bearing: tracing the scan in-graph also pulls LinOSS's surrounding
+    complex einsum readout into Inductor, which mis-codegens complex ops. (Note:
+    Inductor mis-compiles this model's complex *forward* even with the scan kept
+    as a graph break — `torch.compile` is currently unreliable for the LinOSS
+    generator regardless of this kernel; see the partial-reduction backward,
+    validated standalone against a float64 reference.)
+    """
+
     @staticmethod
     def forward(ctx, M_11, M_12, M_21, M_22, F1, F2):
         if not F1.is_cuda:
-            raise RuntimeError("LinOSSScanFunction requires CUDA tensors.")
+            raise RuntimeError("linoss_scan_triton requires CUDA tensors.")
         if F1.shape != F2.shape:
             raise ValueError(f"F1 {F1.shape} != F2 {F2.shape}")
 
@@ -155,62 +224,53 @@ class LinOSSScanFunction(torch.autograd.Function):
         M_12 = M_12.contiguous()
         M_21 = M_21.contiguous()
         M_22 = M_22.contiguous()
+        F1 = F1.contiguous()
+        F2 = F2.contiguous()
 
         B, T, N = F1.shape
-
-        F1_s = _complex_to_stacked(F1)
-        F2_s = _complex_to_stacked(F2)
-        Y1_s = torch.empty_like(F1_s)
-        Y2_s = torch.empty_like(F2_s)
-
+        Y1 = torch.empty_like(F1)
+        Y2 = torch.empty_like(F2)
         BLOCK_N = _block_n_for(N)
-        grid = (2 * B, triton.cdiv(N, BLOCK_N))
-
+        grid = (B, triton.cdiv(N, BLOCK_N))
+        sb, st, sn, sc = _real_strides(T, N)
         _linoss_scan_fwd_kernel[grid](
             M_11, M_12, M_21, M_22,
-            F1_s, F2_s, Y1_s, Y2_s,
-            T, N,
-            F1_s.stride(0), F1_s.stride(1), F1_s.stride(2),
-            BLOCK_N=BLOCK_N,
+            torch.view_as_real(F1), torch.view_as_real(F2),
+            torch.view_as_real(Y1), torch.view_as_real(Y2),
+            T, N, sb, st, sn, sc,
+            BLOCK_N=BLOCK_N, num_warps=_num_warps_for(BLOCK_N),
         )
 
-        ctx.save_for_backward(M_11, M_12, M_21, M_22, Y1_s, Y2_s)
-        ctx.B = B
-        ctx.T = T
-        ctx.N = N
-        ctx.BLOCK_N = BLOCK_N
-
-        return _stacked_to_complex(Y2_s, B)
+        ctx.save_for_backward(M_11, M_12, M_21, M_22, Y1, Y2)
+        return Y2
 
     @staticmethod
     def backward(ctx, dY2):
-        M_11, M_12, M_21, M_22, Y1_s, Y2_s = ctx.saved_tensors
-        B, T, N, BLOCK_N = ctx.B, ctx.T, ctx.N, ctx.BLOCK_N
-
-        dY2_s = _complex_to_stacked(dY2.resolve_conj())
-        dF1_s = torch.empty_like(dY2_s)
-        dF2_s = torch.empty_like(dY2_s)
-
-        dM_11 = torch.zeros_like(M_11)
-        dM_12 = torch.zeros_like(M_12)
-        dM_21 = torch.zeros_like(M_21)
-        dM_22 = torch.zeros_like(M_22)
-
-        grid = (2 * B, triton.cdiv(N, BLOCK_N))
-
+        M_11, M_12, M_21, M_22, Y1, Y2 = ctx.saved_tensors
+        dY2 = dY2.resolve_conj().contiguous()
+        B, T, N = dY2.shape
+        dF1 = torch.empty_like(dY2)
+        dF2 = torch.empty_like(dY2)
+        opts = dict(device=dY2.device, dtype=M_11.dtype)
+        dM_11_p = torch.empty((B, N), **opts)
+        dM_12_p = torch.empty((B, N), **opts)
+        dM_21_p = torch.empty((B, N), **opts)
+        dM_22_p = torch.empty((B, N), **opts)
+        BLOCK_N = _block_n_for(N)
+        grid = (B, triton.cdiv(N, BLOCK_N))
+        sb, st, sn, sc = _real_strides(T, N)
         _linoss_scan_bwd_kernel[grid](
             M_11, M_12, M_21, M_22,
-            Y1_s, Y2_s, dY2_s,
-            dF1_s, dF2_s,
-            dM_11, dM_12, dM_21, dM_22,
-            T, N,
-            dY2_s.stride(0), dY2_s.stride(1), dY2_s.stride(2),
-            BLOCK_N=BLOCK_N,
+            torch.view_as_real(Y1), torch.view_as_real(Y2), torch.view_as_real(dY2),
+            torch.view_as_real(dF1), torch.view_as_real(dF2),
+            dM_11_p, dM_12_p, dM_21_p, dM_22_p,
+            T, N, sb, st, sn, sc,
+            BLOCK_N=BLOCK_N, num_warps=_num_warps_for(BLOCK_N),
         )
-
-        dF1 = _stacked_to_complex(dF1_s, B)
-        dF2 = _stacked_to_complex(dF2_s, B)
-        return dM_11, dM_12, dM_21, dM_22, dF1, dF2
+        return (
+            dM_11_p.sum(0), dM_12_p.sum(0), dM_21_p.sum(0), dM_22_p.sum(0),
+            dF1, dF2,
+        )
 
 
 def linoss_scan_triton(

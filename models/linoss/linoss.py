@@ -35,6 +35,7 @@ class LinOSS(nn.Module):
         r_min: float = 0.9,
         theta_max: float = math.pi,
         use_triton: bool = False,
+        a_from_g: bool = True,
     ):
         super().__init__()
         if discretization == "IM" and damping:
@@ -48,7 +49,7 @@ class LinOSS(nn.Module):
         self.state_dim = state_dim
         self.discretization = discretization
         self.damping = damping
-        self.A_from_G = False
+        self.A_from_G = a_from_g
         self.use_triton = use_triton
 
         self.steps = nn.Parameter(torch.randn(state_dim) * 0.5)
