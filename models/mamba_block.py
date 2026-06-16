@@ -47,6 +47,7 @@ def create_block(
             damping=ssm_params.get("damping", True),
             r_min=ssm_params.get("r_min", 0.9),
             theta_max=ssm_params.get("theta_max", math.pi),
+            a_from_g=ssm_params.get("a_from_g", True),
             use_triton=ssm_params.get("use_triton", False),
         )
         mixer_cls = partial(
