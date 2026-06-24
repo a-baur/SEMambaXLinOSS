@@ -6,11 +6,10 @@ rm -rf mamba-1_2_0_post1/build
 rm -f uv.lock
 
 # 2. Create the virtual environment explicitly
-uv venv
-source .venv/bin/activate
+uv venv --clear
 
 # 3. Pre-seed build dependencies using --extra-index-url to keep standard PyPI access
-uv pip install setuptools wheel packaging "torch>=2.4.0" --extra-index-url https://download.pytorch.org/whl/cu124
+uv pip install setuptools wheel packaging "torch>=2.7.0" --extra-index-url https://download.pytorch.org/whl/cu128
 
 # 4. Sync the rest of the project
-uv sync --extra dev
+MAMBA_FORCE_BUILD=TRUE uv sync --extra dev
