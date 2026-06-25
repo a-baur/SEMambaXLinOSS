@@ -46,8 +46,12 @@ class Evaluator:
         self._device = torch.device("cpu")
         self._sr = sr
 
-    def _lsd(self, clean, pred) -> float:
-        """Mean log-spectral distance (dB-free, log10 power) between clean and pred."""
+    def _lsd(self, clean, pred):
+        """Mean log-spectral distance (dB-free, log10 power) as a 0-dim tensor.
+
+        Returned as a tensor (not ``.item()``) so callers can accumulate on the
+        GPU and sync once; see ``compute(as_tensor=True)``.
+        """
         win = torch.hann_window(_LSD_N_FFT, device=clean.device)
         spec = lambda x: torch.stft(  # noqa: E731
             x, _LSD_N_FFT, _LSD_HOP, window=win, return_complex=True
@@ -55,14 +59,21 @@ class Evaluator:
         log_c = torch.log10(spec(clean) + 1e-10)
         log_p = torch.log10(spec(pred) + 1e-10)
         # L2 across frequency per frame, then averaged over frames (and batch).
-        return torch.sqrt(torch.mean((log_c - log_p) ** 2, dim=-2)).mean().item()
+        return torch.sqrt(torch.mean((log_c - log_p) ** 2, dim=-2)).mean()
 
-    def compute(self, clean, pred, exclude=()) -> EvalMetrics:
+    def compute(self, clean, pred, exclude=(), as_tensor=False) -> EvalMetrics:
         """Compute metrics; names in ``exclude`` are skipped and returned as None.
 
         Excluding the CPU-bound metrics (e.g. ``("nisqa", "estoi")``) keeps the
         in-training validation loop fast while ``evaluate.py`` still gets the
         full suite.
+
+        ``as_tensor=True`` returns the GPU metrics as 0-dim tensors instead of
+        Python floats, so the caller can sum them on-device and call ``.item()``
+        once per validation pass. Each ``.item()`` forces a host<->device sync,
+        which is very expensive at batch_size=1 on high-latency GPUs (e.g. A40);
+        deferring them is the main reason in-training validation was slow. PESQ
+        runs on CPU regardless, so it is always returned as a float.
         """
         exclude = set(exclude)
         mrstft_loss = self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1))
@@ -74,16 +85,24 @@ class Evaluator:
             print(f"Error computing PESQ score: {e}")
             pesq_score = -1.0
 
-        utmos_score = self._utmos(pred, self._sr).item()
-        nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[0].item()  # overall MOS only
-        sisdr_score = self._sisdr(pred, clean).item()
-        estoi_score = None if "estoi" in exclude else self._estoi(pred, clean).item()
+        utmos_score = self._utmos(pred, self._sr).squeeze()
+        nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[0]  # overall MOS only
+        sisdr_score = self._sisdr(pred, clean)
+        estoi_score = None if "estoi" in exclude else self._estoi(pred, clean)
         lsd_score = self._lsd(clean, pred)
         with torch.no_grad():
-            distillmos_score = self._distillmos(pred).mean().item()
+            distillmos_score = self._distillmos(pred).mean()
+
+        if not as_tensor:
+            t = lambda x: None if x is None else x.item()  # noqa: E731
+            mrstft_loss, utmos_score, sisdr_score, lsd_score, distillmos_score = (
+                mrstft_loss.item(), utmos_score.item(), sisdr_score.item(),
+                lsd_score.item(), distillmos_score.item(),
+            )
+            nisqa_score, estoi_score = t(nisqa_score), t(estoi_score)
 
         return EvalMetrics(
-            mrstft_loss.item(),
+            mrstft_loss,
             pesq_score,
             utmos_score,
             distillmos_score,
