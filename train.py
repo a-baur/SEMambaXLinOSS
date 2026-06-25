@@ -176,6 +176,7 @@ def create_dataloader(dataset, cfg, train=True):
     return DataLoader(
         dataset,
         num_workers=num_workers,
+        persistent_workers=True,
         shuffle=(sampler is None) and train,
         sampler=sampler,
         batch_size=batch_size,
