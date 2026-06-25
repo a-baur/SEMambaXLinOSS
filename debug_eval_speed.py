@@ -249,12 +249,86 @@ def bench_metrics(sr):
     print("  whichever line dominates is your bottleneck; PESQ tends to be CPU/clock bound")
 
 
+# --------------------------------------------------------------------------- #
+# 7. OLD vs NEW validation-loop pattern (what actually changed in train.py)
+# --------------------------------------------------------------------------- #
+def bench_loop(sr, n_utts, val_bs, n_jobs):
+    section("VALIDATION-LOOP PATTERN: OLD vs NEW")
+    try:
+        import torch
+        from joblib import Parallel, delayed
+        from utils.metrics import Evaluator
+        from utils.pesq_utils import pesq_wb
+    except Exception as e:
+        print(f"cannot import repo deps ({e}) -- run from repo root")
+        return
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    ev = Evaluator(sr=sr).to(dev)
+    # synthetic full-length utterances (metric stage only; excludes the model fwd)
+    utts = []
+    for _ in range(n_utts):
+        c = torch.randn(1, sr * 6, device=dev).clamp(-1, 1)
+        utts.append((c, (c + 0.05 * torch.randn_like(c)).clamp(-1, 1)))
+    print(f"device={dev}, {n_utts} utts of 6s, val_bs={val_bs}, pesq n_jobs={n_jobs}")
+
+    def warmup():
+        ev.compute(utts[0][0], utts[0][1], exclude=("nisqa", "estoi"), as_tensor=False)
+    warmup()
+    if dev == "cuda":
+        torch.cuda.synchronize()
+
+    # --- OLD: bs=1, .item() per metric per utterance, serial PESQ ---
+    t0 = time.perf_counter()
+    acc = {k: 0.0 for k in ("mrstft", "pesq", "utmos", "distillmos", "sisdr", "lsd")}
+    for c, p in utts:
+        m = ev.compute(c, p, exclude=("nisqa", "estoi"), as_tensor=False)
+        for k in acc:
+            acc[k] += getattr(m, k)
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    old = time.perf_counter() - t0
+
+    # --- NEW: accumulate GPU metrics as tensors, one sync; PESQ in parallel ---
+    # Warm the loky pool first; in training it persists across validation passes,
+    # so the one-time spawn cost should not be charged to the steady-state timing.
+    with Parallel(n_jobs=n_jobs) as _warm:
+        _warm(delayed(pesq_wb)(sr, utts[0][0][0].cpu().numpy(), utts[0][1][0].cpu().numpy())
+              for _ in range(n_jobs))
+    t0 = time.perf_counter()
+    sums = {k: torch.zeros((), device=dev) for k in ("mrstft", "utmos", "distillmos", "sisdr", "lsd")}
+    pesq_sum = 0.0
+    with Parallel(n_jobs=n_jobs) as run_pesq:
+        for i in range(0, len(utts), val_bs):
+            chunk = utts[i:i + val_bs]
+            refs, degs = [], []
+            for c, p in chunk:
+                m = ev.compute(c, p, exclude=("nisqa", "estoi", "pesq"), as_tensor=True)
+                for k in sums:
+                    sums[k] += getattr(m, k)
+                refs.append(c[0].cpu().numpy())
+                degs.append(p[0].cpu().numpy())
+            pesq_sum += float(sum(run_pesq(delayed(pesq_wb)(sr, r, d) for r, d in zip(refs, degs))))
+    _ = {k: v.item() for k, v in sums.items()}  # single sync
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    new = time.perf_counter() - t0
+
+    print(f"  OLD (per-utt .item + serial PESQ): {old:7.2f}s  ({old/n_utts*1e3:6.1f} ms/utt)")
+    print(f"  NEW (batched accum + parallel PESQ): {new:7.2f}s  ({new/n_utts*1e3:6.1f} ms/utt)")
+    print(f"  speedup: {old/new:.1f}x   (excludes the model forward, which also benefits from batching)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", help="valid_clean.json to probe storage/read speed")
     ap.add_argument("--metrics", action="store_true",
                     help="time the real Evaluator (needs repo deps)")
+    ap.add_argument("--loop", action="store_true",
+                    help="benchmark OLD vs NEW validation-loop pattern (needs repo deps)")
+    ap.add_argument("--n-utts", type=int, default=40, help="utterances for --loop")
+    ap.add_argument("--val-bs", type=int, default=8, help="validation batch size for --loop")
+    ap.add_argument("--n-jobs", type=int, default=16, help="parallel PESQ workers for --loop")
     ap.add_argument("--sr", type=int, default=16000, help="sampling rate")
     args = ap.parse_args()
 
@@ -265,6 +339,8 @@ def main():
     bench_gpu()
     if args.metrics:
         bench_metrics(args.sr)
+    if args.loop:
+        bench_loop(args.sr, args.n_utts, args.val_bs, args.n_jobs)
     print("\nDone. Run on both machines and diff the output.\n")
 
 

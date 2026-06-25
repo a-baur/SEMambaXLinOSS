@@ -78,12 +78,16 @@ class Evaluator:
         exclude = set(exclude)
         mrstft_loss = self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1))
 
-        try:
-            pesq_score = self._pesq(pred, clean).item()
-        except Exception as e:
-            # PESQ raises on silent/degenerate utterances (common early in training)
-            print(f"Error computing PESQ score: {e}")
-            pesq_score = -1.0
+        if "pesq" in exclude:
+            # Caller computes PESQ separately (e.g. in parallel across a batch).
+            pesq_score = None
+        else:
+            try:
+                pesq_score = self._pesq(pred, clean).item()
+            except Exception as e:
+                # PESQ raises on silent/degenerate utterances (common early in training)
+                print(f"Error computing PESQ score: {e}")
+                pesq_score = -1.0
 
         utmos_score = self._utmos(pred, self._sr).squeeze()
         nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[0]  # overall MOS only

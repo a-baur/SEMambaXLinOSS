@@ -31,6 +31,8 @@ from utils.util import (
     print_gpu_info, log_model_info, initialize_process_group,
 )
 from utils.metrics import Evaluator
+from utils.pesq_utils import pesq_wb
+from joblib import Parallel, delayed
 
 torch.backends.cudnn.benchmark = True
 # Enable TF32 for float32 matmuls/convs on Ampere+ (faster, negligible quality impact).
@@ -419,7 +421,8 @@ def train(rank, args, cfg):
                     # GPU metrics accumulate as 0-dim tensors so we sync (.item())
                     # only once, after the whole pass -- per-utterance syncs are
                     # what made validation slow at batch_size=1 on the A40. PESQ
-                    # runs on CPU, so it is summed as a Python float.
+                    # is CPU-bound and serial per utterance, so we run a whole
+                    # batch's utterances across processes (joblib) instead.
                     val_sums = {
                         k: torch.zeros((), device=device) for k in (
                             "Magnitude Loss", "Phase Loss", "Complex Loss",
@@ -429,6 +432,14 @@ def train(rank, args, cfg):
                     }
                     val_pesq_sum, n_utts, viz_done = 0.0, 0, 0
 
+                    sr = cfg['stft_cfg']['sampling_rate']
+                    # PESQ is CPU-bound and only parallelises across processes.
+                    # >1 spreads a batch's utterances over a (loky-cached) pool;
+                    # set val_pesq_jobs=1 to fall back to serial (e.g. on boxes
+                    # where syncs are cheap and the pool isn't worth its overhead).
+                    n_pesq_jobs = max(1, cfg['env_setting'].get(
+                        'val_pesq_jobs', cfg['env_setting'].get('num_workers', 4)))
+                    run_pesq = Parallel(n_jobs=n_pesq_jobs) if n_pesq_jobs > 1 else None
                     num_viz_samples = cfg['env_setting'].get('num_viz_samples', 5)
                     viz_max_seconds = cfg['env_setting'].get('viz_max_seconds', 5.0)
 
@@ -447,6 +458,12 @@ def train(rank, args, cfg):
                             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
                             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
 
+                            # One GPU->CPU transfer per batch (not per utterance) to
+                            # feed the CPU-bound PESQ; sliced to true length below.
+                            clean_cpu = clean_audio.cpu()
+                            audio_g_cpu = audio_g.detach().cpu()
+                            pesq_refs, pesq_degs = [], []
+
                             # Metrics are computed per utterance on the true (unpadded)
                             # lengths so the right-padding never leaks into the scores.
                             for b in range(clean_audio.size(0)):
@@ -457,12 +474,14 @@ def train(rank, args, cfg):
                                 ca, ag = clean_audio[b:b+1, :al], audio_g[b:b+1, :al]
                                 min_len = min(ca.size(-1), ag.size(-1))
 
-                                # Skip the CPU-bound NISQA/ESTOI here; evaluate.py still
-                                # reports them. Keeps in-training validation off the CPU.
+                                # Skip CPU-bound NISQA/ESTOI (evaluate.py still reports
+                                # them) and PESQ (computed in parallel after this loop).
                                 metrics = evaluator.compute(
                                     ca[..., :min_len], ag[..., :min_len],
-                                    exclude=("nisqa", "estoi"), as_tensor=True,
+                                    exclude=("nisqa", "estoi", "pesq"), as_tensor=True,
                                 )
+                                pesq_refs.append(clean_cpu[b, :min_len].numpy())
+                                pesq_degs.append(audio_g_cpu[b, :min_len].numpy())
 
                                 val_ip_err, val_gd_err, val_iaf_err = phase_losses(cp, pg, cfg)
                                 val_sums["Phase Loss"] += (val_ip_err + val_gd_err + val_iaf_err)
@@ -473,7 +492,6 @@ def train(rank, args, cfg):
                                 val_sums["DistillMOS Score"] += metrics.distillmos
                                 val_sums["SI-SDR"] += metrics.sisdr
                                 val_sums["LSD"] += metrics.lsd
-                                val_pesq_sum += metrics.pesq
                                 n_utts += 1
 
                                 # Log a handful of example waveforms / spectrograms.
@@ -488,6 +506,14 @@ def train(rank, args, cfg):
                                         max_seconds=viz_max_seconds,
                                     )
                                     viz_done += 1
+
+                            # PESQ across this batch's utterances (parallel if enabled).
+                            if run_pesq is not None:
+                                scores = run_pesq(delayed(pesq_wb)(sr, r, d)
+                                                  for r, d in zip(pesq_refs, pesq_degs))
+                            else:
+                                scores = [pesq_wb(sr, r, d) for r, d in zip(pesq_refs, pesq_degs)]
+                            val_pesq_sum += float(sum(scores))
 
                         # Single host<->device sync for all GPU metrics.
                         val_metrics = {k: v.item() for k, v in val_sums.items()}
