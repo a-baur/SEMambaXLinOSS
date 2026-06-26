@@ -455,6 +455,7 @@ def train(rank, args, cfg):
     batch_size = cfg["training_cfg"]["batch_size"] // cfg["env_setting"]["num_gpus"]
     if num_gpus >= 1:
         initialize_process_group(cfg, rank)
+        torch.cuda.set_device(rank)
         device = torch.device("cuda:{:d}".format(rank))
     else:
         raise RuntimeError("Mamba needs GPU acceleration")
