@@ -29,10 +29,10 @@ from dataloaders.dataloader_vctk import (
     extract_identifier,
     get_clean_path_for_noisy,
 )
-from models.generator import SEMamba
-from models.stfts import mag_phase_istft, mag_phase_stft
 from utils.metrics import Evaluator
 from utils.util import load_config
+from models.generator import SEMamba
+from models.stfts import mag_phase_istft, mag_phase_stft
 
 
 def resolve_checkpoint_and_config(ckpt_arg: str, config_arg: str | None):
