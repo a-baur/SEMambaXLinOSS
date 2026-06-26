@@ -134,15 +134,16 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             noisy_mag = noisy_mag.to(device, non_blocking=True)
             noisy_pha = noisy_pha.to(device, non_blocking=True)
 
-            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
-
             B = clean_audio.size(0)
             alen = torch.as_tensor(audio_lens, device=device)
             flen = torch.as_tensor(frame_lens, device=device)
 
-            # Fixed-size windows make every utterance equal length so the metrics
-            # (and batched PESQ) run as a single call. Right-padding is masked out.
+            nm = _fixed_frames(noisy_mag, flen, n_frames)
+            npa = _fixed_frames(noisy_pha, flen, n_frames)
+            mag_g, pha_g, com_g = generator(nm, npa)
+            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+
+            # Mask the right-padding out of both signals before scoring (see _fixed_*).
             cw, gw = _fixed_window(clean_audio, alen, seg), _fixed_window(audio_g, alen, seg)
             cm, mg = _fixed_frames(clean_mag, flen, n_frames), _fixed_frames(mag_g, flen, n_frames)
             cp, pg = _fixed_frames(clean_pha, flen, n_frames), _fixed_frames(pha_g, flen, n_frames)
@@ -164,18 +165,12 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             val_sums["LSD"] += m.lsd * B
             n_utts += B
 
-            # Log a handful of example waveforms / spectrograms at full length.
+            # Log a handful of example windows as waveforms / spectrograms.
             for b in range(B):
                 if viz_done >= num_viz_samples:
                     break
-                fl, al = frame_lens[b], audio_lens[b]
                 noisy_audio = mag_phase_istft(
-                    noisy_mag[b : b + 1, :, :fl],
-                    noisy_pha[b : b + 1, :, :fl],
-                    n_fft,
-                    hop_size,
-                    win_size,
-                    compress_factor,
+                    nm[b : b + 1], npa[b : b + 1], n_fft, hop_size, win_size, compress_factor
                 )
                 log_audio_and_spectrograms(
                     sw,
@@ -184,12 +179,12 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                     sr,
                     hop_size,
                     compress_factor,
-                    clean_audio[b : b + 1, :al],
+                    cw[b : b + 1],
                     noisy_audio,
-                    audio_g[b : b + 1, :al],
-                    clean_mag[b : b + 1, :, :fl],
-                    noisy_mag[b : b + 1, :, :fl],
-                    mag_g[b : b + 1, :, :fl],
+                    gw[b : b + 1],
+                    cm[b : b + 1],
+                    nm[b : b + 1],
+                    mg[b : b + 1],
                     max_seconds=viz_max_seconds,
                 )
                 viz_done += 1
