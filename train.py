@@ -1,38 +1,44 @@
 import warnings
 
+import numpy as np
 from utils.viz import log_audio_and_spectrograms
 
-warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action="ignore", category=FutureWarning)
+import argparse
 import os
 import time
-import argparse
-import torch
-import wandb
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel
 
+import torch
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+import torch.optim as optim
+import wandb
 from dataloaders.dataloader_vctk import VCTKDemandDataset
-from models.stfts import mag_phase_stft, mag_phase_istft
-from models.generator import SEMamba
-from models.loss import phase_losses
 from models.discriminator import MetricDiscriminator, batch_pesq
+from models.generator import SEMamba
 from models.linoss.linoss import LinOSS
-from models.linoss.selective_linoss import MambOSS
 from models.linoss.mamboss6 import MambOSS6
-from models.s5.s5 import S5SSM
+from models.linoss.selective_linoss import MambOSS
+from models.loss import phase_losses
 from models.s4d.s4d import S4DKernel
-from utils.util import (
-    load_ckpts, load_optimizer_states, save_checkpoint,
-    build_env, load_config, initialize_seed,
-    print_gpu_info, log_model_info, initialize_process_group,
-)
+from models.s5.s5 import S5SSM
+from models.stfts import mag_phase_istft, mag_phase_stft
+from pesq import pesq_batch
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from utils.metrics import Evaluator
-from utils.pesq_utils import pesq_wb
-from joblib import Parallel, delayed
+from utils.util import (
+    build_env,
+    initialize_process_group,
+    initialize_seed,
+    load_ckpts,
+    load_config,
+    load_optimizer_states,
+    log_model_info,
+    print_gpu_info,
+    save_checkpoint,
+)
 
 torch.backends.cudnn.benchmark = True
 # Enable TF32 for float32 matmuls/convs on Ampere+ (faster, negligible quality impact).
@@ -41,7 +47,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=(0.9, 0.999), weight_decay=1e-2):
+def create_partitioned_optimizer(
+    model, base_lr=1e-3, ssm_lr_factor=0.01, betas=(0.9, 0.999), weight_decay=1e-2
+):
     ssm_params = []
     rest_params = []
     ssm_param_ids = set()
@@ -102,7 +110,7 @@ def create_partitioned_optimizer(model, base_lr=1e-3, ssm_lr_factor=0.01, betas=
 
     param_groups = [
         {"params": rest_params, "lr": base_lr, "weight_decay": weight_decay},
-        {"params": ssm_params, "lr": base_lr * ssm_lr_factor, "weight_decay": 0.0}
+        {"params": ssm_params, "lr": base_lr * ssm_lr_factor, "weight_decay": 0.0},
     ]
 
     # Apply the betas globally to the optimizer
@@ -131,38 +139,45 @@ def setup_optimizers(models, cfg):
 
     return optim_g, optim_d
 
+
 def setup_schedulers(optimizers, cfg, last_epoch):
     """Set up learning rate schedulers."""
     optim_g, optim_d = optimizers
-    lr_decay = cfg['training_cfg']['lr_decay']
+    lr_decay = cfg["training_cfg"]["lr_decay"]
 
     scheduler_g = optim.lr_scheduler.ExponentialLR(optim_g, gamma=lr_decay, last_epoch=last_epoch)
     scheduler_d = optim.lr_scheduler.ExponentialLR(optim_d, gamma=lr_decay, last_epoch=last_epoch)
 
     return scheduler_g, scheduler_d
 
-def create_dataset(cfg, train=True, split=True, device='cuda:0'):
+
+def create_dataset(cfg, train=True, split=True, device="cuda:0"):
     """Create dataset based on cfguration."""
-    clean_json = cfg['data_cfg']['train_clean_json'] if train else cfg['data_cfg']['valid_clean_json']
-    noisy_json = cfg['data_cfg']['train_noisy_json'] if train else cfg['data_cfg']['valid_noisy_json']
-    shuffle = (cfg['env_setting']['num_gpus'] <= 1) if train else False
-    pcs = cfg['training_cfg']['use_PCS400'] if train else False
+    clean_json = (
+        cfg["data_cfg"]["train_clean_json"] if train else cfg["data_cfg"]["valid_clean_json"]
+    )
+    noisy_json = (
+        cfg["data_cfg"]["train_noisy_json"] if train else cfg["data_cfg"]["valid_noisy_json"]
+    )
+    shuffle = (cfg["env_setting"]["num_gpus"] <= 1) if train else False
+    pcs = cfg["training_cfg"]["use_PCS400"] if train else False
 
     return VCTKDemandDataset(
         clean_json=clean_json,
         noisy_json=noisy_json,
-        sampling_rate=cfg['stft_cfg']['sampling_rate'],
-        segment_size=cfg['training_cfg']['segment_size'],
-        n_fft=cfg['stft_cfg']['n_fft'],
-        hop_size=cfg['stft_cfg']['hop_size'],
-        win_size=cfg['stft_cfg']['win_size'],
-        compress_factor=cfg['model_cfg']['compress_factor'],
+        sampling_rate=cfg["stft_cfg"]["sampling_rate"],
+        segment_size=cfg["training_cfg"]["segment_size"],
+        n_fft=cfg["stft_cfg"]["n_fft"],
+        hop_size=cfg["stft_cfg"]["hop_size"],
+        win_size=cfg["stft_cfg"]["win_size"],
+        compress_factor=cfg["model_cfg"]["compress_factor"],
         split=split,
         n_cache_reuse=0,
         shuffle=shuffle,
         device=device,
-        pcs=pcs
+        pcs=pcs,
     )
+
 
 def collate_pad(batch):
     """Pad a list of variable-length validation utterances into a batch.
@@ -178,8 +193,8 @@ def collate_pad(batch):
     frame_lens = [b[1].size(-1) for b in batch]
     t_max, f_max = max(audio_lens), max(frame_lens)
 
-    pad_time = lambda x: F.pad(x, (0, f_max - x.size(-1)))            # [F, Tf] -> [F, f_max]
-    pad_com = lambda x: F.pad(x, (0, 0, 0, f_max - x.size(-2)))       # [F, Tf, 2] (pad Tf)
+    pad_time = lambda x: F.pad(x, (0, f_max - x.size(-1)))  # [F, Tf] -> [F, f_max]
+    pad_com = lambda x: F.pad(x, (0, 0, 0, f_max - x.size(-2)))  # [F, Tf, 2] (pad Tf)
 
     clean_audio = torch.stack([F.pad(b[0], (0, t_max - b[0].size(-1))) for b in batch])
     clean_mag = torch.stack([pad_time(b[1]) for b in batch])
@@ -187,7 +202,16 @@ def collate_pad(batch):
     clean_com = torch.stack([pad_com(b[3]) for b in batch])
     noisy_mag = torch.stack([pad_time(b[4]) for b in batch])
     noisy_pha = torch.stack([pad_time(b[5]) for b in batch])
-    return clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha, frame_lens, audio_lens
+    return (
+        clean_audio,
+        clean_mag,
+        clean_pha,
+        clean_com,
+        noisy_mag,
+        noisy_pha,
+        frame_lens,
+        audio_lens,
+    )
 
 
 def create_dataloader(dataset, cfg, train=True):
@@ -199,24 +223,24 @@ def create_dataloader(dataset, cfg, train=True):
         # per-op launch/sync latency dominates on high-latency GPUs (e.g. A40).
         return DataLoader(
             dataset,
-            num_workers=cfg['env_setting'].get('val_num_workers', 4),
+            num_workers=cfg["env_setting"].get("val_num_workers", 4),
             persistent_workers=True,
             shuffle=False,
             sampler=None,
-            batch_size=cfg['training_cfg'].get('val_batch_size', 4),
+            batch_size=cfg["training_cfg"].get("val_batch_size", 4),
             pin_memory=True,
             drop_last=False,
             collate_fn=collate_pad,
         )
 
-    if cfg['env_setting']['num_gpus'] > 1:
+    if cfg["env_setting"]["num_gpus"] > 1:
         sampler = DistributedSampler(dataset)
-        sampler.set_epoch(cfg['training_cfg']['training_epochs'])
-        batch_size = cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']
+        sampler.set_epoch(cfg["training_cfg"]["training_epochs"])
+        batch_size = cfg["training_cfg"]["batch_size"] // cfg["env_setting"]["num_gpus"]
     else:
         sampler = None
-        batch_size = cfg['training_cfg']['batch_size']
-    num_workers = cfg['env_setting']['num_workers']
+        batch_size = cfg["training_cfg"]["batch_size"]
+    num_workers = cfg["env_setting"]["num_workers"]
 
     return DataLoader(
         dataset,
@@ -226,18 +250,22 @@ def create_dataloader(dataset, cfg, train=True):
         sampler=sampler,
         batch_size=batch_size,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
     )
 
 
 def train(rank, args, cfg):
-    num_gpus = cfg['env_setting']['num_gpus']
-    n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
-    compress_factor = cfg['model_cfg']['compress_factor']
-    batch_size = cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']
+    num_gpus = cfg["env_setting"]["num_gpus"]
+    n_fft, hop_size, win_size = (
+        cfg["stft_cfg"]["n_fft"],
+        cfg["stft_cfg"]["hop_size"],
+        cfg["stft_cfg"]["win_size"],
+    )
+    compress_factor = cfg["model_cfg"]["compress_factor"]
+    batch_size = cfg["training_cfg"]["batch_size"] // cfg["env_setting"]["num_gpus"]
     if num_gpus >= 1:
         initialize_process_group(cfg, rank)
-        device = torch.device('cuda:{:d}'.format(rank))
+        device = torch.device("cuda:{:d}".format(rank))
     else:
         raise RuntimeError("Mamba needs GPU acceleration")
 
@@ -245,20 +273,20 @@ def train(rank, args, cfg):
     discriminator = MetricDiscriminator().to(device)
 
     if rank == 0:
-        evaluator = Evaluator(sr=cfg['stft_cfg']['sampling_rate']).to(device)
+        evaluator = Evaluator(sr=cfg["stft_cfg"]["sampling_rate"]).to(device)
         log_model_info(rank, generator, args.exp_path)
 
     state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)
     if state_dict_g is not None:
-        generator.load_state_dict(state_dict_g['generator'], strict=False)
-        discriminator.load_state_dict(state_dict_do['discriminator'], strict=False)
+        generator.load_state_dict(state_dict_g["generator"], strict=False)
+        discriminator.load_state_dict(state_dict_do["discriminator"], strict=False)
 
     if num_gpus > 1 and torch.cuda.is_available():
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
 
-    if cfg['training_cfg'].get('use_pretrainedD', False):
-        discriminator.load_state_dict( torch.load('ckpts/pretrained_discriminator.pth') )
+    if cfg["training_cfg"].get("use_pretrainedD", False):
+        discriminator.load_state_dict(torch.load("ckpts/pretrained_discriminator.pth"))
         print("Loaded pretrained weight from ckpts/pretrained_discriminator.pth.")
 
     # Create optimizer and schedulers
@@ -275,24 +303,31 @@ def train(rank, args, cfg):
     if rank == 0:
         validset = create_dataset(cfg, train=False, split=False, device=device)
         validation_loader = create_dataloader(validset, cfg, train=False)
-        wandb.init(project="SEMambaXLinOSS", name=args.exp_name, dir=args.exp_path,
-                   config=cfg, sync_tensorboard=True)
-        sw = SummaryWriter(os.path.join(args.exp_path, 'logs'))
+        wandb.init(
+            project="SEMambaXLinOSS",
+            name=args.exp_name,
+            dir=args.exp_path,
+            config=cfg,
+            sync_tensorboard=True,
+        )
+        sw = SummaryWriter(os.path.join(args.exp_path, "logs"))
 
     generator.train()
     discriminator.train()
 
     best_pesq, best_pesq_step = 0.0, 0
     best_utmos, best_utmos_step = 0.0, 0
-    for epoch in range(max(0, last_epoch), cfg['training_cfg']['training_epochs']):
+    for epoch in range(max(0, last_epoch), cfg["training_cfg"]["training_epochs"]):
         if rank == 0:
             start = time.time()
-            print("Epoch: {}".format(epoch+1))
+            print("Epoch: {}".format(epoch + 1))
 
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
-            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = (
+                batch  # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+            )
             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
             clean_mag = torch.autograd.Variable(clean_mag.to(device, non_blocking=True))
             clean_pha = torch.autograd.Variable(clean_pha.to(device, non_blocking=True))
@@ -304,7 +339,10 @@ def train(rank, args, cfg):
             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
 
             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
-            audio_list_r, audio_list_g = list(clean_audio.cpu().numpy()), list(audio_g.detach().cpu().numpy())
+            audio_list_r, audio_list_g = (
+                list(clean_audio.cpu().numpy()),
+                list(audio_g.detach().cpu().numpy()),
+            )
             batch_pesq_score = batch_pesq(audio_list_r, audio_list_g, cfg)
 
             # Discriminator
@@ -343,16 +381,18 @@ def train(rank, args, cfg):
             metric_g = discriminator(clean_mag, mag_g)
             loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
             # Consistancy Loss
-            _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
+            _, _, rec_com = mag_phase_stft(
+                audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True
+            )
             loss_con = F.mse_loss(com_g, rec_com) * 2
 
             loss_gen_all = (
-                loss_metric * cfg['training_cfg']['loss']['metric'] +
-                loss_mag * cfg['training_cfg']['loss']['magnitude'] +
-                loss_pha * cfg['training_cfg']['loss']['phase'] +
-                loss_com * cfg['training_cfg']['loss']['complex'] +
-                loss_time * cfg['training_cfg']['loss']['time'] +
-                loss_con * cfg['training_cfg']['loss']['consistancy']
+                loss_metric * cfg["training_cfg"]["loss"]["metric"]
+                + loss_mag * cfg["training_cfg"]["loss"]["magnitude"]
+                + loss_pha * cfg["training_cfg"]["loss"]["phase"]
+                + loss_com * cfg["training_cfg"]["loss"]["complex"]
+                + loss_time * cfg["training_cfg"]["loss"]["time"]
+                + loss_con * cfg["training_cfg"]["loss"]["consistancy"]
             )
 
             loss_gen_all.backward()
@@ -361,45 +401,58 @@ def train(rank, args, cfg):
 
             if rank == 0:
                 # STDOUT logging
-                if steps % cfg['env_setting']['stdout_interval'] == 0:
+                if steps % cfg["env_setting"]["stdout_interval"] == 0:
                     with torch.no_grad():
                         metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
                         mag_error = F.mse_loss(clean_mag, mag_g).item()
                         pha_error = (loss_ip + loss_gd + loss_iaf).item()
                         com_error = F.mse_loss(clean_com, com_g).item()
                         time_error = F.l1_loss(clean_audio, audio_g).item()
-                        con_error = F.mse_loss( com_g, rec_com ).item()
+                        con_error = F.mse_loss(com_g, rec_com).item()
 
                         print(
-                            'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                            "Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, "
+                            "Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}".format(
+                                steps,
+                                loss_gen_all,
+                                loss_disc_all,
+                                metric_error,
+                                mag_error,
+                                pha_error,
+                                com_error,
+                                time_error,
+                                con_error,
+                                time.time() - start_b,
                             )
                         )
 
                 # Checkpointing
-                if steps % cfg['env_setting']['checkpoint_interval'] == 0 and steps != 0:
+                if steps % cfg["env_setting"]["checkpoint_interval"] == 0 and steps != 0:
                     exp_name = f"{args.exp_path}/g_{steps:08d}.pth"
                     save_checkpoint(
                         exp_name,
                         {
-                            'generator': (generator.module if num_gpus > 1 else generator).state_dict()
-                        }
+                            "generator": (
+                                generator.module if num_gpus > 1 else generator
+                            ).state_dict()
+                        },
                     )
                     exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
                     save_checkpoint(
                         exp_name,
                         {
-                            'discriminator': (discriminator.module if num_gpus > 1 else discriminator).state_dict(),
-                            'optim_g': optim_g.state_dict(),
-                            'optim_d': optim_d.state_dict(),
-                            'steps': steps,
-                            'epoch': epoch
-                        }
+                            "discriminator": (
+                                discriminator.module if num_gpus > 1 else discriminator
+                            ).state_dict(),
+                            "optim_g": optim_g.state_dict(),
+                            "optim_d": optim_d.state_dict(),
+                            "steps": steps,
+                            "epoch": epoch,
+                        },
                     )
 
                 # Tensorboard summary logging
-                if steps % cfg['env_setting']['summary_interval'] == 0:
+                if steps % cfg["env_setting"]["summary_interval"] == 0:
                     sw.add_scalar("Training/Generator Loss", loss_gen_all, steps)
                     sw.add_scalar("Training/Discriminator Loss", loss_disc_all, steps)
                     sw.add_scalar("Training/Metric Loss", metric_error, steps)
@@ -414,38 +467,43 @@ def train(rank, args, cfg):
                     raise ValueError("NaN values found in loss_gen_all")
 
                 # Validation
-                if steps % cfg['env_setting']['validation_interval'] == 0 and steps != 0:
+                if steps % cfg["env_setting"]["validation_interval"] == 0 and steps != 0:
                     generator.eval()
                     torch.cuda.empty_cache()
 
                     # GPU metrics accumulate as 0-dim tensors so we sync (.item())
-                    # only once, after the whole pass -- per-utterance syncs are
-                    # what made validation slow at batch_size=1 on the A40. PESQ
-                    # is CPU-bound and serial per utterance, so we run a whole
-                    # batch's utterances across processes (joblib) instead.
+                    # only once, after the whole pass
                     val_sums = {
-                        k: torch.zeros((), device=device) for k in (
-                            "Magnitude Loss", "Phase Loss", "Complex Loss",
-                            "MultiResSTFT Loss", "UTMOS Score", "DistillMOS Score",
-                            "SI-SDR", "LSD",
+                        k: torch.zeros((), device=device)
+                        for k in (
+                            "Magnitude Loss",
+                            "Phase Loss",
+                            "Complex Loss",
+                            "MultiResSTFT Loss",
+                            "UTMOS Score",
+                            "DistillMOS Score",
+                            "SI-SDR",
+                            "LSD",
                         )
                     }
                     val_pesq_sum, n_utts, viz_done = 0.0, 0, 0
 
-                    sr = cfg['stft_cfg']['sampling_rate']
-                    # PESQ is CPU-bound and only parallelises across processes.
-                    # >1 spreads a batch's utterances over a (loky-cached) pool;
-                    # set val_pesq_jobs=1 to fall back to serial (e.g. on boxes
-                    # where syncs are cheap and the pool isn't worth its overhead).
-                    n_pesq_jobs = max(1, cfg['env_setting'].get(
-                        'val_pesq_jobs', cfg['env_setting'].get('num_workers', 4)))
-                    run_pesq = Parallel(n_jobs=n_pesq_jobs) if n_pesq_jobs > 1 else None
-                    num_viz_samples = cfg['env_setting'].get('num_viz_samples', 5)
-                    viz_max_seconds = cfg['env_setting'].get('viz_max_seconds', 5.0)
+                    sr = cfg["stft_cfg"]["sampling_rate"]
+                    num_viz_samples = cfg["env_setting"].get("num_viz_samples", 5)
+                    viz_max_seconds = cfg["env_setting"].get("viz_max_seconds", 5.0)
 
                     with torch.no_grad():
                         for batch in validation_loader:
-                            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha, frame_lens, audio_lens = batch
+                            (
+                                clean_audio,
+                                clean_mag,
+                                clean_pha,
+                                clean_com,
+                                noisy_mag,
+                                noisy_pha,
+                                frame_lens,
+                                audio_lens,
+                            ) = batch
                             clean_audio = clean_audio.to(device, non_blocking=True)
                             clean_mag = clean_mag.to(device, non_blocking=True)
                             clean_pha = clean_pha.to(device, non_blocking=True)
@@ -453,13 +511,11 @@ def train(rank, args, cfg):
                             noisy_mag = noisy_mag.to(device, non_blocking=True)
                             noisy_pha = noisy_pha.to(device, non_blocking=True)
 
-                            # Single batched forward -- this is the step that keeps
-                            # the GPU busy instead of stalling at batch_size=1.
                             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-                            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+                            audio_g = mag_phase_istft(
+                                mag_g, pha_g, n_fft, hop_size, win_size, compress_factor
+                            )
 
-                            # One GPU->CPU transfer per batch (not per utterance) to
-                            # feed the CPU-bound PESQ; sliced to true length below.
                             clean_cpu = clean_audio.cpu()
                             audio_g_cpu = audio_g.detach().cpu()
                             pesq_refs, pesq_degs = [], []
@@ -468,23 +524,23 @@ def train(rank, args, cfg):
                             # lengths so the right-padding never leaks into the scores.
                             for b in range(clean_audio.size(0)):
                                 fl, al = frame_lens[b], audio_lens[b]
-                                cm, mg = clean_mag[b:b+1, :, :fl], mag_g[b:b+1, :, :fl]
-                                cp, pg = clean_pha[b:b+1, :, :fl], pha_g[b:b+1, :, :fl]
-                                cc, cg = clean_com[b:b+1, :, :fl], com_g[b:b+1, :, :fl]
-                                ca, ag = clean_audio[b:b+1, :al], audio_g[b:b+1, :al]
+                                cm, mg = clean_mag[b : b + 1, :, :fl], mag_g[b : b + 1, :, :fl]
+                                cp, pg = clean_pha[b : b + 1, :, :fl], pha_g[b : b + 1, :, :fl]
+                                cc, cg = clean_com[b : b + 1, :, :fl], com_g[b : b + 1, :, :fl]
+                                ca, ag = clean_audio[b : b + 1, :al], audio_g[b : b + 1, :al]
                                 min_len = min(ca.size(-1), ag.size(-1))
 
-                                # Skip CPU-bound NISQA/ESTOI (evaluate.py still reports
-                                # them) and PESQ (computed in parallel after this loop).
                                 metrics = evaluator.compute(
-                                    ca[..., :min_len], ag[..., :min_len],
-                                    exclude=("nisqa", "estoi", "pesq"), as_tensor=True,
+                                    ca[..., :min_len],
+                                    ag[..., :min_len],
+                                    exclude=("nisqa", "estoi", "pesq"),
+                                    as_tensor=True,
                                 )
                                 pesq_refs.append(clean_cpu[b, :min_len].numpy())
                                 pesq_degs.append(audio_g_cpu[b, :min_len].numpy())
 
                                 val_ip_err, val_gd_err, val_iaf_err = phase_losses(cp, pg, cfg)
-                                val_sums["Phase Loss"] += (val_ip_err + val_gd_err + val_iaf_err)
+                                val_sums["Phase Loss"] += val_ip_err + val_gd_err + val_iaf_err
                                 val_sums["Magnitude Loss"] += F.mse_loss(cm, mg)
                                 val_sums["Complex Loss"] += F.mse_loss(cc, cg)
                                 val_sums["MultiResSTFT Loss"] += metrics.mrstft
@@ -497,22 +553,36 @@ def train(rank, args, cfg):
                                 # Log a handful of example waveforms / spectrograms.
                                 if viz_done < num_viz_samples:
                                     noisy_audio = mag_phase_istft(
-                                        noisy_mag[b:b+1, :, :fl], noisy_pha[b:b+1, :, :fl],
-                                        n_fft, hop_size, win_size, compress_factor)
+                                        noisy_mag[b : b + 1, :, :fl],
+                                        noisy_pha[b : b + 1, :, :fl],
+                                        n_fft,
+                                        hop_size,
+                                        win_size,
+                                        compress_factor,
+                                    )
                                     log_audio_and_spectrograms(
-                                        sw, viz_done, steps, cfg['stft_cfg']['sampling_rate'], hop_size, compress_factor,
-                                        ca, noisy_audio, ag,
-                                        cm, noisy_mag[b:b+1, :, :fl], mg,
+                                        sw,
+                                        viz_done,
+                                        steps,
+                                        cfg["stft_cfg"]["sampling_rate"],
+                                        hop_size,
+                                        compress_factor,
+                                        ca,
+                                        noisy_audio,
+                                        ag,
+                                        cm,
+                                        noisy_mag[b : b + 1, :, :fl],
+                                        mg,
                                         max_seconds=viz_max_seconds,
                                     )
                                     viz_done += 1
 
-                            # PESQ across this batch's utterances (parallel if enabled).
-                            if run_pesq is not None:
-                                scores = run_pesq(delayed(pesq_wb)(sr, r, d)
-                                                  for r, d in zip(pesq_refs, pesq_degs))
-                            else:
-                                scores = [pesq_wb(sr, r, d) for r, d in zip(pesq_refs, pesq_degs)]
+                            scores = pesq_batch(
+                                cfg["stft_cfg"]["sampling_rate"],
+                                np.array(pesq_refs),
+                                np.array(pesq_degs),
+                                mode="wb",
+                            )
                             val_pesq_sum += float(sum(scores))
 
                         # Single host<->device sync for all GPU metrics.
@@ -531,7 +601,7 @@ def train(rank, args, cfg):
                             "LSD": val_metrics["LSD"],
                         }
 
-                        log_str = f"VALIDATION"
+                        log_str = "VALIDATION"
                         for metric, scores in val_metrics.items():
                             score = scores / max(n_utts, 1)  # average across utterances
                             sw.add_scalar(f"Validation/{metric}", score, steps)
@@ -557,38 +627,42 @@ def train(rank, args, cfg):
         scheduler_d.step()
 
         if rank == 0:
-            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+            print(
+                "Time taken for epoch {} is {} sec\n".format(epoch + 1, int(time.time() - start))
+            )
 
     if rank == 0:
         sw.close()
         wandb.finish()
 
+
 # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='MambOSS_MBank_EARS')
-    parser.add_argument('--config', default='/data5/baur/SEMambaXLinOSS/recipes/selective/MambOSS.yaml')
+    parser.add_argument("--exp_folder", default="exp")
+    parser.add_argument("--exp_name", default="MambOSS_MBank_EARS")
+    parser.add_argument(
+        "--config", default="/data5/baur/SEMambaXLinOSS/recipes/selective/MambOSS.yaml"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    seed = cfg['env_setting']['seed']
-    num_gpus = cfg['env_setting']['num_gpus']
+    seed = cfg["env_setting"]["seed"]
+    num_gpus = cfg["env_setting"]["num_gpus"]
     available_gpus = torch.cuda.device_count()
 
     if num_gpus > available_gpus:
         warnings.warn(
             f"Warning: The actual number of available GPUs ({available_gpus}) is less than the .yaml config ({num_gpus}). Auto reset to num_gpu = {available_gpus}",
-            UserWarning
+            UserWarning,
         )
-        cfg['env_setting']['num_gpus'] = available_gpus
+        cfg["env_setting"]["num_gpus"] = available_gpus
         num_gpus = available_gpus
         time.sleep(5)
 
-
     initialize_seed(seed)
     args.exp_path = os.path.join(args.exp_folder, args.exp_name)
-    build_env(args.config, 'config.yaml', args.exp_path)
+    build_env(args.config, "config.yaml", args.exp_path)
 
     if torch.cuda.is_available():
         print_gpu_info(cfg)
@@ -600,5 +674,6 @@ def main():
     else:
         train(0, args, cfg)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
