@@ -24,6 +24,18 @@ def load_json_file(file_path):
         data = json.load(json_file)
     return data
 
+def remap_to_data_root(paths, data_root, orig_root):
+    """Rebase absolute wav paths from ``orig_root`` onto ``data_root``.
+
+    The dataset JSONs store absolute wav paths (clean and noisy under different
+    subdirs of a shared parent). When the data has been staged to fast node-local
+    storage (e.g. SLURM ``$TMPDIR``), set ``data_root`` to the staged base; each
+    path is re-pointed there while preserving its layout relative to ``orig_root``.
+    ``orig_root`` must be the prefix shared by *both* clean and noisy paths so the
+    distinguishing subdir (clean_.../noisy_...) survives the rebase.
+    """
+    return [os.path.join(data_root, os.path.relpath(p, orig_root)) for p in paths]
+
 def _common_root(file_paths):
     """Deepest directory shared by all paths (used to build a dataset-relative key)."""
     if len(file_paths) == 1:
@@ -76,15 +88,29 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
         hop_size=100, 
         win_size=400, 
         compress_factor=1.0, 
-        split=True, 
-        n_cache_reuse=1, 
-        shuffle=True, 
-        device=None, 
-        pcs=False
+        split=True,
+        n_cache_reuse=1,
+        shuffle=True,
+        device=None,
+        pcs=False,
+        data_root=None,
+        orig_data_root=None
     ):
 
         self.clean_wavs_path = load_json_file( clean_json )
         self.noisy_wavs_path = load_json_file( noisy_json )
+
+        # Optionally rebase the stored absolute wav paths onto a staged copy of
+        # the data (e.g. node-local $TMPDIR). orig_data_root defaults to the
+        # prefix shared by every clean+noisy path so the clean/noisy subdirs are
+        # preserved under data_root.
+        if data_root:
+            orig_root = orig_data_root or os.path.commonpath(
+                self.clean_wavs_path + self.noisy_wavs_path
+            )
+            self.clean_wavs_path = remap_to_data_root(self.clean_wavs_path, data_root, orig_root)
+            self.noisy_wavs_path = remap_to_data_root(self.noisy_wavs_path, data_root, orig_root)
+
         random.seed(1234)
 
         if shuffle:

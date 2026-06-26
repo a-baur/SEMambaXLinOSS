@@ -352,9 +352,17 @@ def create_dataset(cfg, train=True, split=True, device="cuda:0"):
     shuffle = (cfg["env_setting"]["num_gpus"] <= 1) if train else False
     pcs = cfg["training_cfg"]["use_PCS400"] if train else False
 
+    # Rebase wav paths onto staged data (e.g. SLURM $TMPDIR) when requested. The
+    # DATA_ROOT env var wins over the optional data_cfg.data_root config key, so a
+    # job script can point training at node-local storage without editing recipes.
+    data_root = os.environ.get("DATA_ROOT") or cfg["data_cfg"].get("data_root")
+    orig_data_root = os.environ.get("DATA_ROOT_ORIG") or cfg["data_cfg"].get("orig_data_root")
+
     return VCTKDemandDataset(
         clean_json=clean_json,
         noisy_json=noisy_json,
+        data_root=data_root,
+        orig_data_root=orig_data_root,
         sampling_rate=cfg["stft_cfg"]["sampling_rate"],
         segment_size=cfg["training_cfg"]["segment_size"],
         n_fft=cfg["stft_cfg"]["n_fft"],
@@ -425,7 +433,8 @@ def create_dataloader(dataset, cfg, train=True):
 
     if cfg["env_setting"]["num_gpus"] > 1:
         sampler = DistributedSampler(dataset)
-        sampler.set_epoch(cfg["training_cfg"]["training_epochs"])
+        # set_epoch is called per-epoch in the training loop so each epoch
+        # reshuffles; setting it once here would freeze the shuffle order.
         batch_size = cfg["training_cfg"]["batch_size"] // cfg["env_setting"]["num_gpus"]
     else:
         sampler = None
@@ -512,6 +521,12 @@ def train(rank, args, cfg):
         if rank == 0:
             start = time.time()
             print("Epoch: {}".format(epoch + 1))
+
+        # Reshuffle each epoch and keep the per-rank split in sync across ranks.
+        if train_loader.sampler is not None and isinstance(
+            train_loader.sampler, DistributedSampler
+        ):
+            train_loader.sampler.set_epoch(epoch)
 
         for i, batch in enumerate(train_loader):
             if rank == 0:
