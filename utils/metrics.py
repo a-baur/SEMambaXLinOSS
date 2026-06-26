@@ -1,5 +1,7 @@
+import os
 from dataclasses import dataclass
 
+import distillmos
 import torch
 from auraloss.freq import MultiResolutionSTFTLoss
 from torchmetrics.audio import (
@@ -8,8 +10,6 @@ from torchmetrics.audio import (
     ScaleInvariantSignalDistortionRatio,
     ShortTimeObjectiveIntelligibility,
 )
-import distillmos
-
 
 # STFT used for the log-spectral distance (independent of the model's analysis STFT).
 _LSD_N_FFT = 1024
@@ -33,11 +33,12 @@ class Evaluator:
     def __init__(self, sr):
 
         self._mrstft = MultiResolutionSTFTLoss(sample_rate=sr)
-        self._pesq = PerceptualEvaluationSpeechQuality(fs=sr, mode="wb")
-        self._utmos = (
-            torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True)
-            .eval()
+        self._pesq = PerceptualEvaluationSpeechQuality(
+            fs=sr, mode="wb", n_processes=os.cpu_count() or 1
         )
+        self._utmos = torch.hub.load(
+            "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
+        ).eval()
         self._nisqa = NonIntrusiveSpeechQualityAssessment(sr)
         self._sisdr = ScaleInvariantSignalDistortionRatio()
         self._estoi = ShortTimeObjectiveIntelligibility(sr, extended=True)
@@ -89,8 +90,8 @@ class Evaluator:
                 print(f"Error computing PESQ score: {e}")
                 pesq_score = -1.0
 
-        utmos_score = self._utmos(pred, self._sr).squeeze()
-        nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[0]  # overall MOS only
+        utmos_score = self._utmos(pred, self._sr).mean()  # mean over batch
+        nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[..., 0].mean()
         sisdr_score = self._sisdr(pred, clean)
         estoi_score = None if "estoi" in exclude else self._estoi(pred, clean)
         lsd_score = self._lsd(clean, pred)
@@ -100,8 +101,11 @@ class Evaluator:
         if not as_tensor:
             t = lambda x: None if x is None else x.item()  # noqa: E731
             mrstft_loss, utmos_score, sisdr_score, lsd_score, distillmos_score = (
-                mrstft_loss.item(), utmos_score.item(), sisdr_score.item(),
-                lsd_score.item(), distillmos_score.item(),
+                mrstft_loss.item(),
+                utmos_score.item(),
+                sisdr_score.item(),
+                lsd_score.item(),
+                distillmos_score.item(),
             )
             nisqa_score, estoi_score = t(nisqa_score), t(estoi_score)
 
