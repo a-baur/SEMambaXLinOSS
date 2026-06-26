@@ -109,7 +109,11 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             "LSD",
         )
     }
-    val_pesq_sum, n_utts, viz_done = 0.0, 0, 0
+    # PESQ is the only CPU metric; collect its (fixed-length) windows on the GPU
+    # and score them in a single batched call after the loop, so the per-batch
+    # path never touches the host.
+    pesq_clean, pesq_pred = [], []
+    n_utts, viz_done = 0, 0
 
     with torch.no_grad():
         for batch in validation_loader:
@@ -145,7 +149,9 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             cc, cg = _fixed_frames(clean_com, flen, n_frames), _fixed_frames(com_g, flen, n_frames)
 
             ip, gd, iaf = phase_losses(cp, pg, cfg)
-            m = evaluator.compute(cw, gw, exclude=("nisqa", "estoi"), as_tensor=True)
+            m = evaluator.compute(cw, gw, exclude=("nisqa", "estoi", "pesq"), as_tensor=True)
+            pesq_clean.append(cw)
+            pesq_pred.append(gw)
 
             # Sum over batches (weighted by batch size) and average once at the end.
             val_sums["Phase Loss"] += (ip + gd + iaf) * B
@@ -156,7 +162,6 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             val_sums["DistillMOS Score"] += m.distillmos * B
             val_sums["SI-SDR"] += m.sisdr * B
             val_sums["LSD"] += m.lsd * B
-            val_pesq_sum += m.pesq * B
             n_utts += B
 
             # Log a handful of example waveforms / spectrograms at full length.
@@ -189,26 +194,37 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                 )
                 viz_done += 1
 
-    # Single host<->device sync for all GPU metrics.
-    val_metrics = {k: v.item() for k, v in val_sums.items()}
-    val_metrics["PESQ Score"] = val_pesq_sum
+    # One CPU round-trip + one n_processes pool for all of PESQ
+    pesq_score = (
+        evaluator.compute(
+            torch.cat(pesq_clean),
+            torch.cat(pesq_pred),
+            exclude=("nisqa", "estoi", "mrstft", "utmos", "distillmos", "sisdr", "lsd"),
+        ).pesq
+        if pesq_pred
+        else 0.0
+    )
+
+    # Average every GPU metric with a single host<->device sync (one .tolist()).
+    keys = list(val_sums)
+    averaged = dict(zip(keys, (torch.stack([val_sums[k] for k in keys]) / max(n_utts, 1)).tolist()))
+
     # PESQ logged after Complex Loss to preserve the original ordering.
     val_metrics = {
-        "Magnitude Loss": val_metrics["Magnitude Loss"],
-        "Phase Loss": val_metrics["Phase Loss"],
-        "Complex Loss": val_metrics["Complex Loss"],
-        "PESQ Score": val_metrics["PESQ Score"],
-        "MultiResSTFT Loss": val_metrics["MultiResSTFT Loss"],
-        "UTMOS Score": val_metrics["UTMOS Score"],
-        "DistillMOS Score": val_metrics["DistillMOS Score"],
-        "SI-SDR": val_metrics["SI-SDR"],
-        "LSD": val_metrics["LSD"],
+        "Magnitude Loss": averaged["Magnitude Loss"],
+        "Phase Loss": averaged["Phase Loss"],
+        "Complex Loss": averaged["Complex Loss"],
+        "PESQ Score": pesq_score,
+        "MultiResSTFT Loss": averaged["MultiResSTFT Loss"],
+        "UTMOS Score": averaged["UTMOS Score"],
+        "DistillMOS Score": averaged["DistillMOS Score"],
+        "SI-SDR": averaged["SI-SDR"],
+        "LSD": averaged["LSD"],
     }
 
     best_pesq, best_pesq_step, best_utmos, best_utmos_step = best
     log_str = "VALIDATION"
-    for metric, total in val_metrics.items():
-        score = total / max(n_utts, 1)  # average across utterances
+    for metric, score in val_metrics.items():
         sw.add_scalar(f"Validation/{metric}", score, steps)
         log_str += f" | {metric}: {score:.4f}"
 

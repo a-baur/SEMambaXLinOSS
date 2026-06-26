@@ -77,36 +77,39 @@ class Evaluator:
         runs on CPU regardless, so it is always returned as a float.
         """
         exclude = set(exclude)
-        mrstft_loss = self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1))
+        keep = lambda name: name not in exclude  # noqa: E731
 
-        if "pesq" in exclude:
-            # Caller computes PESQ separately (e.g. in parallel across a batch).
+        mrstft_loss = (
+            self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1)) if keep("mrstft") else None
+        )
+
+        if not keep("pesq"):
+            # Caller computes PESQ separately (e.g. once over the whole pass).
             pesq_score = None
         else:
             try:
+                # torchmetrics parallelizes across the batch via n_processes.
                 pesq_score = self._pesq(pred, clean).item()
             except Exception as e:
                 # PESQ raises on silent/degenerate utterances (common early in training)
                 print(f"Error computing PESQ score: {e}")
                 pesq_score = -1.0
 
-        utmos_score = self._utmos(pred, self._sr).mean()  # mean over batch
-        nisqa_score = None if "nisqa" in exclude else self._nisqa(pred)[..., 0].mean()
-        sisdr_score = self._sisdr(pred, clean)
-        estoi_score = None if "estoi" in exclude else self._estoi(pred, clean)
-        lsd_score = self._lsd(clean, pred)
-        with torch.no_grad():
-            distillmos_score = self._distillmos(pred).mean()
+        utmos_score = self._utmos(pred, self._sr).mean() if keep("utmos") else None
+        nisqa_score = self._nisqa(pred)[..., 0].mean() if keep("nisqa") else None
+        sisdr_score = self._sisdr(pred, clean) if keep("sisdr") else None
+        estoi_score = self._estoi(pred, clean) if keep("estoi") else None
+        lsd_score = self._lsd(clean, pred) if keep("lsd") else None
+        distillmos_score = None
+        if keep("distillmos"):
+            with torch.no_grad():
+                distillmos_score = self._distillmos(pred).mean()
 
         if not as_tensor:
             t = lambda x: None if x is None else x.item()  # noqa: E731
-            mrstft_loss, utmos_score, sisdr_score, lsd_score, distillmos_score = (
-                mrstft_loss.item(),
-                utmos_score.item(),
-                sisdr_score.item(),
-                lsd_score.item(),
-                distillmos_score.item(),
-            )
+            mrstft_loss = t(mrstft_loss)
+            utmos_score, sisdr_score = t(utmos_score), t(sisdr_score)
+            lsd_score, distillmos_score = t(lsd_score), t(distillmos_score)
             nisqa_score, estoi_score = t(nisqa_score), t(estoi_score)
 
         return EvalMetrics(
