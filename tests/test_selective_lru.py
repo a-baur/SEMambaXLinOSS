@@ -1,4 +1,4 @@
-"""Tests for models.linoss.mamboss6.MambOSS6 (per-channel oscillatory selective SSM)."""
+"""Tests for models.linoss.SelectiveLRU.SelectiveLRU (per-channel oscillatory selective SSM)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from models.linoss.mamboss6 import MambOSS6
+from selective_lru.selective_lru import SelectiveLRU
 
 
-def _make(in_features=8, state_dim=4, seed=0, **kw):
+def _make(d_model=8, d_state=4, seed=0, **kw):
     torch.manual_seed(seed)
-    return MambOSS6(in_features=in_features, state_dim=state_dim, **kw)
+    return SelectiveLRU(d_model=d_model, d_state=d_state, **kw)
 
 
 def test_forward_shape_and_dtype():
@@ -81,19 +81,19 @@ def test_deterministic_forward():
 
 
 def test_parameter_shapes_and_effective_state():
-    in_features, state_dim = 8, 4
-    m = MambOSS6(in_features=in_features, state_dim=state_dim)
-    # Shared selective B/C (state_dim wide), not dense per-channel matrices.
-    assert m.B_proj.weight.shape == (state_dim, in_features)
-    assert m.C_proj.weight.shape == (2 * state_dim, in_features)
-    # Per-(channel, mode) static dynamics -> effective state in_features * state_dim.
-    assert m.A_log.shape == (in_features, state_dim)
-    assert m.omega.shape == (in_features, state_dim)
-    assert m.D.shape == (in_features,)
-    # dt_rank defaults to ceil(in_features / 64) -> 1 here.
+    d_model, d_state = 8, 4
+    m = SelectiveLRU(d_model=d_model, d_state=d_state)
+    # Shared selective B/C (d_state wide), not dense per-channel matrices.
+    assert m.B_proj.weight.shape == (d_state, d_model)
+    assert m.C_proj.weight.shape == (2 * d_state, d_model)
+    # Per-(channel, mode) static dynamics -> effective state d_model * d_state.
+    assert m.A_log.shape == (d_model, d_state)
+    assert m.omega.shape == (d_model, d_state)
+    assert m.D.shape == (d_model,)
+    # dt_rank defaults to ceil(d_model / 64) -> 1 here.
     assert m.dt_rank == 1
-    assert m.dt_nu_down.weight.shape == (1, in_features)
-    assert m.dt_nu_up.weight.shape == (in_features, 1)
+    assert m.dt_nu_down.weight.shape == (1, d_model)
+    assert m.dt_nu_up.weight.shape == (d_model, 1)
 
 
 def test_transition_is_a_contraction():
@@ -101,7 +101,7 @@ def test_transition_is_a_contraction():
     # so every eigenvalue magnitude is strictly < 1 for any input — the structural,
     # schedule-free stability guarantee (selective_linoss.md sections 6, 10) per channel.
     torch.manual_seed(0)
-    m = _make(in_features=8, state_dim=4)
+    m = _make(d_model=8, d_state=4)
     x = torch.randn(3, 12, 8)
     delta_nu = F.softplus(m.dt_nu_up(m.dt_nu_down(x)))    # (B, T, C) > 0
     a = torch.exp(m.A_log)                                 # (C, N) > 0
@@ -112,7 +112,7 @@ def test_transition_is_a_contraction():
 def test_baseline_nu_in_unit_disk_band():
     # At zero selective contribution, baseline Delta_nu = softplus(dt_nu_up.bias) lies in
     # [dt_min, dt_max], so baseline |lambda| = exp(-Delta_nu * a) is near (but below) 1.
-    m = MambOSS6(in_features=16, state_dim=8, dt_min=1e-3, dt_max=0.1)
+    m = SelectiveLRU(d_model=16, d_state=8, dt_min=1e-3, dt_max=0.1)
     dt = F.softplus(m.dt_nu_up.bias)
     assert (dt >= 1e-3 - 1e-6).all() and (dt <= 0.1 + 1e-6).all()
 
@@ -120,10 +120,10 @@ def test_baseline_nu_in_unit_disk_band():
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _copy_model_to(model: MambOSS6, device, use_triton: bool) -> MambOSS6:
-    twin = MambOSS6(
-        in_features=model.in_features,
-        state_dim=model.state_dim,
+def _copy_model_to(model: SelectiveLRU, device, use_triton: bool) -> SelectiveLRU:
+    twin = SelectiveLRU(
+        d_model=model.d_model,
+        d_state=model.d_state,
         dt_rank=model.dt_rank,
         use_triton=use_triton,
     ).to(device)
@@ -156,7 +156,7 @@ def _fused_reference(dnu, dth, a, om, Bs, Cre, Cim, x, D):
 def test_fused_op_matches_reference_direct(B, T, C, N, chunk):
     # Fused scan+readout vs the materialized reference: forward and all 9 input grads.
     # Shapes cover T that is / isn't a multiple of the chunk width (single & multi chunk).
-    from models.linoss.mamboss6_triton import fused_mamboss6
+    from selective_lru.selective_lru_triton import fused_selective_lru
 
     torch.manual_seed(B + T + C + N)
     raw = dict(
@@ -174,7 +174,7 @@ def test_fused_op_matches_reference_direct(B, T, C, N, chunk):
     tri_in = {k: v.clone().requires_grad_(True) for k, v in raw.items()}
 
     y_ref = _fused_reference(**ref_in)
-    y_tri = fused_mamboss6(
+    y_tri = fused_selective_lru(
         tri_in["dnu"], tri_in["dth"], tri_in["a"], tri_in["om"], tri_in["Bs"],
         torch.complex(tri_in["Cre"], tri_in["Cim"]), tri_in["x"], tri_in["D"], block_t=chunk,
     )
@@ -191,7 +191,7 @@ def test_fused_op_matches_reference_direct(B, T, C, N, chunk):
 
 @cuda_only
 def test_triton_forward_matches_reference():
-    cpu_model = _make(in_features=8, state_dim=4)
+    cpu_model = _make(d_model=8, d_state=4)
     triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
     ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
 
@@ -208,7 +208,7 @@ def test_triton_forward_matches_reference():
 
 @cuda_only
 def test_triton_backward_matches_reference():
-    cpu_model = _make(in_features=8, state_dim=4)
+    cpu_model = _make(d_model=8, d_state=4)
     triton_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=True)
     ref_model = _copy_model_to(cpu_model, torch.device("cuda"), use_triton=False)
 

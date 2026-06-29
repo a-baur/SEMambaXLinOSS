@@ -1,45 +1,3 @@
-"""Fused Triton kernels for MambOSS6: the per-channel oscillatory state never hits HBM.
-
-The naive MambOSS6 path materializes the full per-channel state ``(B, T, C, N)`` (channel
-axis ``C = expand*hid_feature``, ``N = state_dim`` modes) to compute ``lambda``/``Bu``, run
-the scan, and save the trajectory for backward — ~20x MambOSS's footprint. These kernels
-fuse the whole pipeline -- spectral coordinates -> complex scan -> ``C``-readout -- so that:
-
-  * **Forward** keeps a ``(BLOCK_C, N)`` tile of complex state in registers, recomputes
-    ``lambda_k``/``Bu_k`` inline, and writes *only* ``y = Re(C h) + D x`` of shape
-    ``(B, T, C)`` (plus small chunk-boundary checkpoints for backward). The ``(B, T, C, N)``
-    state is never written.
-  * **Backward** reuses the forward checkpoints (no extra forward sweep): walking chunks in
-    reverse it refills one chunk's ``h`` into a ``(B, C, BLOCK_T, N)`` scratch and runs the
-    adjoint (reverse) complex scan there. Peak extra HBM is one chunk-width of state, not
-    the full ``T`` — the full ``(B, T, C, N)`` never coexists in memory.
-
-Throughput. Each program owns a ``BLOCK_C`` slab of channels for one batch row, so the
-shared ``Bsel``/``C`` vectors are loaded once per slab (not once per channel); the
-channel-reduced grads (``dBsel``, ``dC``) are summed across the slab *in registers* before a
-single ``atomic_add``, and the batch-reduced grads (``da``, ``domega``, ``dD``) are
-accumulated across the whole sequence in registers and flushed with one atomic at the end.
-The reverse pass carries ``lambda_{t+1}`` between steps instead of recomputing it.
-
-The op boundary is the small, already-projected tensors (``delta_nu``, ``delta_theta``,
-``a = exp(A_log)``, ``omega``, ``Bsel = B_proj(x)``, ``C = C_proj(x)``, ``x``, ``D``); the
-cheap projections and the ``exp`` stay in PyTorch autograd, which chains onto the grads this
-Function returns.
-
-Transition / readout (per channel ``c``, mode ``n``, step ``k``):
-
-    nu     = exp(-delta_nu_k * a_n),  theta = omega_n + delta_theta_k,  lambda = nu*e^{i theta}
-    Bu     = (delta_nu_k * Bsel_{k,n}) * x_{k,c}          (real drive)
-    h_k    = lambda * h_{k-1} + Bu_k
-    y_{k,c} = Re( sum_n C_{k,n} h_{k,n} ) + D_c x_{k,c}
-
-Adjoint (mirrors ``selective_triton`` conventions, validated there): with ``g_k = dy_k *
-conj(C_k)`` the upstream grad on the scan output, ``G_k = g_k + conj(lambda_{k+1}) G_{k+1}``,
-``dBu_k = G_k``, ``dlam_k = G_k conj(h_{k-1})``; the ``(nu, theta)`` and ``Bu`` grads then
-chain to ``delta_nu``/``delta_theta``/``a``/``omega``/``Bsel``/``x``, and the readout adds the
-``C``/``D``/``x`` terms.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -52,7 +10,7 @@ def _block_n(n: int) -> int:
 
 
 @triton.jit
-def _mamboss6_fwd_kernel(
+def _selective_lru_fwd_kernel(
     dnu_ptr, dth_ptr, x_ptr,          # (B, T, C)
     a_ptr, om_ptr, D_ptr,             # (C, N), (C, N), (C,)
     Bs_ptr, Cre_ptr, Cim_ptr,         # (B, T, N)
@@ -115,16 +73,16 @@ def _mamboss6_fwd_kernel(
 
 
 @triton.jit
-def _mamboss6_bwd_kernel(
+def _selective_lru_bwd_kernel(
     dnu_ptr, dth_ptr, x_ptr,          # (B, T, C)
-    a_ptr, om_ptr, D_ptr,             # (C, N), (C, N), (C,)
+    a_ptr, om_ptr, D_ptr,     # (C, N), (C, N), (C,)
     Bs_ptr, Cre_ptr, Cim_ptr,         # (B, T, N)
-    dy_ptr,                           # (B, T, C)  upstream grad
-    ckpt_re_ptr, ckpt_im_ptr,         # (B, NC, C, N)  chunk-boundary states (from forward)
-    ht_re_ptr, ht_im_ptr,             # (B, C, BLOCK_T, N)  within-chunk state scratch
-    d_dnu_ptr, d_dth_ptr, dx_ptr,     # (B, T, C)  per-element grads (direct write)
-    da_ptr, dom_ptr, dD_ptr,          # (C, N), (C, N), (C,)  batch-reduced grads (atomic)
-    dBs_ptr, dCre_ptr, dCim_ptr,      # (B, T, N)  channel-reduced grads (atomic)
+    dy_ptr,                                                 # (B, T, C)  upstream grad
+    ckpt_re_ptr, ckpt_im_ptr,           # (B, NC, C, N)  chunk-boundary states (from forward)
+    ht_re_ptr, ht_im_ptr,                                   # (B, C, BLOCK_T, N)  within-chunk state scratch
+    d_dnu_ptr, d_dth_ptr, dx_ptr,                           # (B, T, C)  per-element grads (direct write)
+    da_ptr, dom_ptr, dD_ptr,                          # (C, N), (C, N), (C,)  batch-reduced grads (atomic)
+    dBs_ptr, dCre_ptr, dCim_ptr,                            # (B, T, N)  channel-reduced grads (atomic)
     B, T, C, N, NC,
     BLOCK_C: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -262,7 +220,7 @@ def _mamboss6_bwd_kernel(
     tl.atomic_add(dD_ptr + oc, dD_acc, mask=mc)
 
 
-class _MambOSS6Scan(torch.autograd.Function):
+class _SelectiveLRUScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, delta_nu, delta_theta, a, omega, Bsel, Cre, Cim, x, D, block_t, block_c):
         if not delta_nu.is_cuda:
@@ -296,7 +254,7 @@ class _MambOSS6Scan(torch.autograd.Function):
             ckpt_re = dnu.new_empty(1)
             ckpt_im = dnu.new_empty(1)
 
-        _mamboss6_fwd_kernel[grid](
+        _selective_lru_fwd_kernel[grid](
             dnu, dth, x, a, omega, D, Bsel, Cre, Cim, y, ckpt_re, ckpt_im,
             B, T, C, N, NC,
             BLOCK_C=BLOCK_C, BLOCK_N=BLOCK_N, BLOCK_T=block_t, SAVE_CKPT=save,
@@ -329,7 +287,7 @@ class _MambOSS6Scan(torch.autograd.Function):
         dCre = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
         dCim = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
 
-        _mamboss6_bwd_kernel[grid](
+        _selective_lru_bwd_kernel[grid](
             dnu, dth, x, a, omega, D, Bsel, Cre, Cim, dy.contiguous(),
             ckpt_re, ckpt_im, ht_re, ht_im,
             d_dnu, d_dth, dx, da, dom, dD, dBs, dCre, dCim,
@@ -340,7 +298,7 @@ class _MambOSS6Scan(torch.autograd.Function):
         return d_dnu, d_dth, da, dom, dBs, dCre, dCim, dx, dD, None, None
 
 
-def fused_mamboss6(
+def fused_selective_lru(
     delta_nu: torch.Tensor,
     delta_theta: torch.Tensor,
     a: torch.Tensor,
@@ -352,15 +310,12 @@ def fused_mamboss6(
     block_t: int = 16,
     block_c: int = 32,
 ) -> torch.Tensor:
-    """Fused MambOSS6 scan + readout. Returns ``y`` of shape ``(B, T, C)``.
+    """Fused selective LRU scan + readout. Returns ``y`` of shape ``(B, T, C)``.
 
-    Args mirror the spectral-coordinate form: ``delta_nu``/``delta_theta`` ``(B, T, C)``,
-    ``a``/``omega`` ``(C, N)``, ``Bsel`` ``(B, T, N)`` real, ``C_complex`` ``(B, T, N)``
-    complex, ``x`` ``(B, T, C)``, ``D`` ``(C,)``. ``block_t`` is the backward chunk width
-    (peak extra HBM scales with it); ``block_c`` is the per-program channel-slab width
-    (throughput knob — bigger shares more B/C loads and shrinks atomic traffic).
+    block_t is the backward chunk width (peak extra HBM scales with it);
+    block_c is the per-program channel-slab width  (throughput knob, bigger shares more B/C loads and shrinks atomic traffic).
     """
-    return _MambOSS6Scan.apply(
+    return _SelectiveLRUScan.apply(
         delta_nu, delta_theta, a, omega, Bsel,
         C_complex.real.contiguous(), C_complex.imag.contiguous(),
         x, D, block_t, block_c,

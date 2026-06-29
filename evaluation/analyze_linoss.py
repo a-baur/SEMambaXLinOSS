@@ -438,7 +438,7 @@ def _collect_axis(linoss_mods, axis_name, omega, n_ir):
         B = torch.complex(m.B[..., 0], m.B[..., 1]).detach().cpu().numpy()
         C = torch.complex(m.C[..., 0], m.C[..., 1]).detach().cpu().numpy()
         couplings.append(np.abs(B).mean(1) * np.abs(C).mean(0))
-        layers.append(np.full(m.state_dim, _module_metadata(name)["layer"]))
+        layers.append(np.full(m.d_state, _module_metadata(name)["layer"]))
     if not Hs:
         return None
     return {

@@ -12,12 +12,12 @@ from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba3 import Mamba3
 from mamba_ssm.ops.triton.layer_norm import RMSNorm
 
-from models.linoss.linoss import LinOSS
-from models.linoss.mamboss6 import MambOSS6
-from models.linoss.selective_linoss import MambOSS
-from models.mixer import MambaStyleMixer
+from models.linoss import LinOSS
+from models.selective_lru import SelectiveLRU
+from selective_lru import SelectiveLRUMIMO
 from models.s4d.s4d import S4DCore
 from models.s5.s5 import S5
+from models.mixer import MambaStyleMixer
 
 
 # github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
@@ -125,7 +125,7 @@ def create_block(
         )
 
     elif ssm == "selective_linoss":
-        ssm = MambOSS(
+        ssm = SelectiveLRUMIMO(
             in_features=expand * d_model,
             state_dim=d_state,
             r_min=ssm_params.get("r_min", 0.9),
@@ -143,9 +143,9 @@ def create_block(
         )
 
     elif ssm == "mamboss6":
-        ssm = MambOSS6(
-            in_features=expand * d_model,
-            state_dim=d_state,
+        ssm = SelectiveLRU(
+            d_model=expand * d_model,
+            d_state=d_state,
             dt_rank=ssm_params.get("dt_rank", None),
             dt_min=ssm_params.get("dt_min", 1e-3),
             dt_max=ssm_params.get("dt_max", 0.1),

@@ -23,15 +23,9 @@ Port of ``MambaStyleLinOSSSequenceMixer`` from the JAX/Equinox ``linax`` repo.
 
 from __future__ import annotations
 
-import math
-from typing import Literal
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from models.linoss.linoss import LinOSS
-from models.linoss.selective_linoss import MambOSS
 
 
 class MambaStyleMixer(nn.Module):

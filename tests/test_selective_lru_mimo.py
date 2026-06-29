@@ -5,12 +5,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from models.linoss.selective_linoss import MambOSS, _selective_recurrence
+from selective_lru.selective_lru import _selective_recurrence
+from selective_lru import SelectiveLRUMIMO
 
 
 def _make(in_features=8, state_dim=16, seed=0):
     torch.manual_seed(seed)
-    return MambOSS(in_features=in_features, state_dim=state_dim)
+    return SelectiveLRUMIMO(in_features=in_features, state_dim=state_dim)
 
 
 def test_forward_shape_and_dtype():
@@ -81,7 +82,7 @@ def test_deterministic_forward():
 
 def test_parameter_shapes():
     in_features, state_dim = 8, 16
-    m = MambOSS(in_features=in_features, state_dim=state_dim)
+    m = SelectiveLRUMIMO(in_features=in_features, state_dim=state_dim)
     assert m.nu_proj.weight.shape == (state_dim, in_features)
     assert m.theta_proj.weight.shape == (state_dim, in_features)
     assert m.B.shape == (state_dim, in_features, 2)
@@ -92,7 +93,7 @@ def test_parameter_shapes():
 def test_eigenvalue_magnitude_init_in_band():
     # At zero selective contribution the baseline magnitude nu = sigmoid(c_nu) must
     # fall in the [r_min, r_max] band the init targets (spec section 9).
-    m = MambOSS(in_features=8, state_dim=64, r_min=0.9, r_max=0.999)
+    m = SelectiveLRUMIMO(in_features=8, state_dim=64, r_min=0.9, r_max=0.999)
     nu0 = torch.sigmoid(m.nu_proj.bias)
     assert (nu0 >= 0.9).all() and (nu0 <= 0.999).all()
 
@@ -115,9 +116,9 @@ def test_transition_is_a_contraction():
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _copy_model_to(model: MambOSS, device, use_triton: bool) -> MambOSS:
+def _copy_model_to(model: SelectiveLRUMIMO, device, use_triton: bool) -> SelectiveLRUMIMO:
     """Fresh SelectiveLinOSS with the same config on `device`, params copied over."""
-    twin = MambOSS(
+    twin = SelectiveLRUMIMO(
         in_features=model.in_features,
         state_dim=model.state_dim,
         use_triton=use_triton,
@@ -131,7 +132,7 @@ def _copy_model_to(model: MambOSS, device, use_triton: bool) -> MambOSS:
 @cuda_only
 def test_triton_scan_matches_reference_direct():
     # Raw selective scan vs the sequential reference, forward + grads w.r.t. lam, Bu.
-    from models.linoss.selective_triton import selective_scan_triton
+    from selective_lru.selective_lru_mimo_triton import selective_scan_triton
 
     torch.manual_seed(0)
     B, T, N = 3, 17, 16
