@@ -132,7 +132,7 @@ class SelectiveLRU(nn.Module):
 
         if self.use_triton:
             # Fused scan + readout: the state never loads into HBM.
-            from selective_lru.selective_lru_triton import fused_selective_lru
+            from models.selective_lru.selective_lru_triton import fused_selective_lru
             return fused_selective_lru(
                 delta_nu, delta_theta, a, self.omega, B_sel, C_complex, x, self.D,
                 block_t=self.chunk_size, block_c=self.block_c,

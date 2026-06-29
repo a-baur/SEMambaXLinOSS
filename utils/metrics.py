@@ -30,11 +30,16 @@ class EvalMetrics:
 
 
 class Evaluator:
-    def __init__(self, sr):
-
+    def __init__(self, sr, pesq_n_processes=1):
+        # ``pesq_n_processes`` only helps when PESQ is fed a real batch: torchmetrics
+        # then dispatches to ``pesq_batch``, which forks a multiprocessing pool across
+        # the batch dimension. At batch_size=1 (e.g. evaluate.py's per-utterance loop)
+        # it forks/tears down that pool for a single value on every call -- ~60x slower
+        # than the sequential path -- so keep the default at 1 and let the batched
+        # validation loop in train.py opt in.
         self._mrstft = MultiResolutionSTFTLoss(sample_rate=sr)
         self._pesq = PerceptualEvaluationSpeechQuality(
-            fs=sr, mode="wb", n_processes=os.cpu_count() or 1
+            fs=sr, mode="wb", n_processes=pesq_n_processes
         )
         self._utmos = torch.hub.load(
             "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True

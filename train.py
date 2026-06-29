@@ -44,74 +44,37 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-def _fixed_window(audio, lens, size):
-    """Crop/zero-pad ``(B, T)`` waveforms to exactly ``size`` samples.
-
-    Every sample past each utterance's true ``lens`` is zeroed, so the dataloader's
-    right-padding -- and any model output produced over it -- never leaks into a
-    metric. Utterances longer than ``size`` are cropped to their first ``size``
-    samples. The result is a homogeneous batch every metric can score in one call.
-    """
-    T = audio.size(-1)
-    audio = audio[:, :size] if T >= size else F.pad(audio, (0, size - T))
-    keep = torch.arange(size, device=audio.device)[None, :] < lens.clamp(max=size)[:, None]
-    return audio * keep
-
-
-def _fixed_frames(spec, lens, n_frames):
-    """Crop/zero-pad spectral features to ``n_frames`` frames (see ``_fixed_window``).
-
-    Handles both ``(B, F, T)`` magnitude/phase and ``(B, F, T, 2)`` complex tensors;
-    ``lens`` is the true per-utterance frame count.
-    """
-    T = spec.size(2)
-    if T < n_frames:
-        pad = (0, 0, 0, n_frames - T) if spec.dim() == 4 else (0, n_frames - T)
-        spec = F.pad(spec, pad)
-    else:
-        spec = spec[:, :, :n_frames]
-    keep = torch.arange(n_frames, device=spec.device)[None, :] < lens.clamp(max=n_frames)[:, None]
-    keep = keep[:, None, :, None] if spec.dim() == 4 else keep[:, None, :]
-    return spec * keep
-
-
 def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, stft_params, best):
     """Run the rank-0 validation pass, log averaged metrics, and return updated bests.
 
-    Every utterance is scored on a fixed ``segment_size`` window (cropped if longer,
-    zero-padded if shorter) so all metrics -- including PESQ, which parallelizes
-    across the batch via ``n_processes`` -- run as a single batched call instead of
-    a per-utterance Python loop. ``best`` is the running
-    ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated.
+    Every utterance is scored at its full native length: the batched, right-padded
+    loader is unpacked and each utterance is cropped back to its true frame / sample
+    count before the generator and every metric see it, so neither the 2 s training
+    window nor the batch padding ever reaches the model or the scores. ``best`` is
+    the running ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated.
     """
     n_fft, hop_size, win_size, compress_factor = stft_params
     sr = cfg["stft_cfg"]["sampling_rate"]
-    seg = cfg["training_cfg"]["segment_size"]
-    n_frames = seg // hop_size + 1
     num_viz_samples = cfg["env_setting"].get("num_viz_samples", 5)
     viz_max_seconds = cfg["env_setting"].get("viz_max_seconds", 5.0)
 
     generator.eval()
     torch.cuda.empty_cache()
 
-    # GPU metrics accumulate as 0-dim tensors so we sync (.item()) only once, at the end.
-    val_sums = {
-        k: torch.zeros((), device=device)
-        for k in (
+    val_sums = dict.fromkeys(
+        (
             "Magnitude Loss",
             "Phase Loss",
             "Complex Loss",
+            "PESQ Score",
             "MultiResSTFT Loss",
             "UTMOS Score",
             "DistillMOS Score",
             "SI-SDR",
             "LSD",
-        )
-    }
-    # PESQ is the only CPU metric; collect its (fixed-length) windows on the GPU
-    # and score them in a single batched call after the loop, so the per-batch
-    # path never touches the host.
-    pesq_clean, pesq_pred = [], []
+        ),
+        0.0,
+    )
     n_utts, viz_done = 0, 0
 
     with torch.no_grad():
@@ -133,88 +96,63 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             noisy_mag = noisy_mag.to(device, non_blocking=True)
             noisy_pha = noisy_pha.to(device, non_blocking=True)
 
-            B = clean_audio.size(0)
-            alen = torch.as_tensor(audio_lens, device=device)
-            flen = torch.as_tensor(frame_lens, device=device)
+            # Score one full-length utterance at a time. Cropping each item back to
+            # its true length before the generator keeps the batch padding out of the
+            # (bidirectional) model entirely -- nothing it never produced reaches the
+            # metrics, and the whole utterance, not a 2 s window, is enhanced.
+            for b in range(clean_audio.size(0)):
+                fl, al = frame_lens[b], audio_lens[b]
+                nm = noisy_mag[b : b + 1, :, :fl]
+                npa = noisy_pha[b : b + 1, :, :fl]
+                cm = clean_mag[b : b + 1, :, :fl]
+                cp = clean_pha[b : b + 1, :, :fl]
+                cc = clean_com[b : b + 1, :, :fl]
+                ca = clean_audio[b : b + 1, :al]
 
-            nm = _fixed_frames(noisy_mag, flen, n_frames)
-            npa = _fixed_frames(noisy_pha, flen, n_frames)
-            mag_g, pha_g, com_g = generator(nm, npa)
-            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+                mag_g, pha_g, com_g = generator(nm, npa)
+                audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+                min_len = min(ca.size(-1), audio_g.size(-1))
 
-            # Mask the right-padding out of both signals before scoring (see _fixed_*).
-            cw, gw = _fixed_window(clean_audio, alen, seg), _fixed_window(audio_g, alen, seg)
-            cm, mg = _fixed_frames(clean_mag, flen, n_frames), _fixed_frames(mag_g, flen, n_frames)
-            cp, pg = _fixed_frames(clean_pha, flen, n_frames), _fixed_frames(pha_g, flen, n_frames)
-            cc, cg = _fixed_frames(clean_com, flen, n_frames), _fixed_frames(com_g, flen, n_frames)
-
-            ip, gd, iaf = phase_losses(cp, pg, cfg)
-            m = evaluator.compute(cw, gw, exclude=("nisqa", "estoi", "pesq"), as_tensor=True)
-            pesq_clean.append(cw)
-            pesq_pred.append(gw)
-
-            # Sum over batches (weighted by batch size) and average once at the end.
-            val_sums["Phase Loss"] += (ip + gd + iaf) * B
-            val_sums["Magnitude Loss"] += F.mse_loss(cm, mg) * B
-            val_sums["Complex Loss"] += F.mse_loss(cc, cg) * B
-            val_sums["MultiResSTFT Loss"] += m.mrstft * B
-            val_sums["UTMOS Score"] += m.utmos * B
-            val_sums["DistillMOS Score"] += m.distillmos * B
-            val_sums["SI-SDR"] += m.sisdr * B
-            val_sums["LSD"] += m.lsd * B
-            n_utts += B
-
-            # Log a handful of example windows as waveforms / spectrograms.
-            for b in range(B):
-                if viz_done >= num_viz_samples:
-                    break
-                noisy_audio = mag_phase_istft(
-                    nm[b : b + 1], npa[b : b + 1], n_fft, hop_size, win_size, compress_factor
+                ip, gd, iaf = phase_losses(cp, pha_g, cfg)
+                m = evaluator.compute(
+                    ca[..., :min_len], audio_g[..., :min_len], exclude=("nisqa", "estoi")
                 )
-                log_audio_and_spectrograms(
-                    sw,
-                    viz_done,
-                    steps,
-                    sr,
-                    hop_size,
-                    compress_factor,
-                    cw[b : b + 1],
-                    noisy_audio,
-                    gw[b : b + 1],
-                    cm[b : b + 1],
-                    nm[b : b + 1],
-                    mg[b : b + 1],
-                    max_seconds=viz_max_seconds,
-                )
-                viz_done += 1
 
-    # One CPU round-trip + one n_processes pool for all of PESQ
-    pesq_score = (
-        evaluator.compute(
-            torch.cat(pesq_clean),
-            torch.cat(pesq_pred),
-            exclude=("nisqa", "estoi", "mrstft", "utmos", "distillmos", "sisdr", "lsd"),
-        ).pesq
-        if pesq_pred
-        else 0.0
-    )
+                val_sums["Phase Loss"] += (ip + gd + iaf).item()
+                val_sums["Magnitude Loss"] += F.mse_loss(cm, mag_g).item()
+                val_sums["Complex Loss"] += F.mse_loss(cc, com_g).item()
+                val_sums["PESQ Score"] += m.pesq
+                val_sums["MultiResSTFT Loss"] += m.mrstft
+                val_sums["UTMOS Score"] += m.utmos
+                val_sums["DistillMOS Score"] += m.distillmos
+                val_sums["SI-SDR"] += m.sisdr
+                val_sums["LSD"] += m.lsd
+                n_utts += 1
 
-    # Average every GPU metric with a single host<->device sync (one .tolist()).
-    keys = list(val_sums)
-    averaged = dict(zip(keys, (torch.stack([val_sums[k] for k in keys]) / max(n_utts, 1)).tolist()))
+                # Log a handful of example utterances as waveforms / spectrograms.
+                if viz_done < num_viz_samples:
+                    noisy_audio = mag_phase_istft(
+                        nm, npa, n_fft, hop_size, win_size, compress_factor
+                    )
+                    log_audio_and_spectrograms(
+                        sw,
+                        viz_done,
+                        steps,
+                        sr,
+                        hop_size,
+                        compress_factor,
+                        ca,
+                        noisy_audio,
+                        audio_g,
+                        cm,
+                        nm,
+                        mag_g,
+                        max_seconds=viz_max_seconds,
+                    )
+                    viz_done += 1
 
-    # PESQ logged after Complex Loss to preserve the original ordering.
-    val_metrics = {
-        "Magnitude Loss": averaged["Magnitude Loss"],
-        "Phase Loss": averaged["Phase Loss"],
-        "Complex Loss": averaged["Complex Loss"],
-        "PESQ Score": pesq_score,
-        "MultiResSTFT Loss": averaged["MultiResSTFT Loss"],
-        "UTMOS Score": averaged["UTMOS Score"],
-        "DistillMOS Score": averaged["DistillMOS Score"],
-        "SI-SDR": averaged["SI-SDR"],
-        "LSD": averaged["LSD"],
-    }
+    # Average across utterances.
+    val_metrics = {k: v / max(n_utts, 1) for k, v in val_sums.items()}
 
     best_pesq, best_pesq_step, best_utmos, best_utmos_step = best
     log_str = "VALIDATION"
@@ -449,7 +387,10 @@ def train(rank, args, cfg):
     discriminator = MetricDiscriminator().to(device)
 
     if rank == 0:
-        evaluator = Evaluator(sr=cfg["stft_cfg"]["sampling_rate"]).to(device)
+        # Validation runs PESQ over a real batch, so parallelize across it.
+        evaluator = Evaluator(
+            sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=os.cpu_count() or 1
+        ).to(device)
         log_model_info(rank, generator, args.exp_path)
 
     state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)

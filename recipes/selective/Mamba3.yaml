@@ -67,7 +67,7 @@ model_cfg:
   output_channel: 1  # Single Channel Speech Enhancement
 
   ssm: mamba3
-  d_state: 16  # State vector dim. (Mamba3 upstream default is 128; kept at 16 for parity with other recipes.)
+  d_state: 128  # State vector dim. (Mamba3 upstream default is 128; kept at 16 for parity with other recipes.)
   d_conv: 4  # Unused by Mamba3 (head-based, no short conv); kept for config-shape consistency.
   expand: 4  # Inner expansion factor. d_inner = expand * hid_feature must be divisible by ssm_params.headdim.
   norm_epsilon: 0.00001  # Numerical stability in the block normalization layers.
