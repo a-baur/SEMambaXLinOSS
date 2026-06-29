@@ -16,8 +16,7 @@ from dataloaders.dataloader_vctk import VCTKDemandDataset
 from models.discriminator import MetricDiscriminator, batch_pesq
 from models.generator import SEMamba
 from models.linoss.linoss import LinOSS
-from selective_lru.selective_lru import SelectiveLRU
-from selective_lru import SelectiveLRUMIMO
+from models.selective_lru import SelectiveLRU, SelectiveLRUMIMO
 from models.loss import phase_losses
 from models.s4d.s4d import S4DKernel
 from models.s5.s5 import S5SSM
@@ -251,29 +250,6 @@ def create_partitioned_optimizer(
                 if param is not None and param.requires_grad:
                     ssm_params.append(param)
                     ssm_param_ids.add(id(param))
-        elif isinstance(module, SelectiveLRUMIMO):
-            # Only the baseline-bank biases (c_nu, c_theta) — the S-LinOSS analog of the
-            # LTI dynamics scalars steps/A_diag/G_diag — get the low SSM LR. The selective
-            # weight matrices W_nu/W_theta *are* the input-dependence; they start tiny and
-            # must train at the base LR to learn, so they fall through to rest_params.
-            for proj in [module.nu_proj, module.theta_proj]:
-                if proj.bias is not None and proj.bias.requires_grad:
-                    ssm_params.append(proj.bias)
-                    ssm_param_ids.add(id(proj.bias))
-        elif isinstance(module, SelectiveLRU):
-            # Static per-(channel, mode) dynamics A_log/omega and the two time-step
-            # baselines (dt_*_up.bias) are the LTI analog of LinOSS's A_diag/G_diag/steps
-            # — low SSM LR, no weight decay. The low-rank selective projection weights
-            # *are* the input-dependence and stay at the base LR (like MambOSS's W_nu/W_theta).
-            for attr in ["A_log", "omega"]:
-                param = getattr(module, attr, None)
-                if param is not None and param.requires_grad:
-                    ssm_params.append(param)
-                    ssm_param_ids.add(id(param))
-            for proj in [module.dt_nu_up, module.dt_theta_up]:
-                if proj.bias is not None and proj.bias.requires_grad:
-                    ssm_params.append(proj.bias)
-                    ssm_param_ids.add(id(proj.bias))
         elif isinstance(module, S5SSM):
             # S5's continuous-time dynamics (eigenvalues Lambda_re/Lambda_im and the
             # per-mode timescales log_step) are the analog of LinOSS's A_diag/G_diag/steps:

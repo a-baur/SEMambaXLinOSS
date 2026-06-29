@@ -6,13 +6,22 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from linoss.linoss import _uniform_init, _project_input
+
+def _uniform_init(shape, std: float = 1.0) -> torch.Tensor:
+    return torch.empty(*shape).uniform_(-std, std)
 
 
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
     # Inverse of softplus: returns y such that softplus(y) = x, for x > 0. Stable form
     # used by Mamba's dt init (x + log(-expm1(-x)) == x + log1p(-exp(-x))).
     return x + torch.log(-torch.expm1(-x))
+
+
+def _project_input(B_complex: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    # Real-times-complex projection: (N, F) x (B, T, F) -> (B, T, N) complex.
+    Bu_real = torch.einsum("nf,btf->btn", B_complex.real, x)
+    Bu_imag = torch.einsum("nf,btf->btn", B_complex.imag, x)
+    return torch.complex(Bu_real, Bu_imag)
 
 
 class SelectiveLRU(nn.Module):
@@ -194,7 +203,7 @@ class SelectiveLRUMIMO(nn.Module):
             Bu = Bu * gamma
 
         if self.use_triton:
-            from selective_lru.selective_lru_mimo_triton import selective_scan_triton
+            from models.selective_lru.selective_lru_mimo_triton import selective_scan_triton
             h = selective_scan_triton(lam, Bu)       # (B, T, N) complex
         else:
             h = _selective_recurrence(lam, Bu)       # (B, T, N) complex

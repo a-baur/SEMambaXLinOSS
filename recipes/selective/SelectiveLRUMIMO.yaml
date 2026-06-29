@@ -72,7 +72,7 @@ model_cfg:
   norm_epsilon: 0.00001  # Numerical stability in normalization layers within the Mamba blocks.
   causal_conv: true      # causal depthwise conv before the SSM
 
-  ssm: selective_linoss               # 'mamba' | 'linoss' (LTI) | 'selective_linoss' (S-LinOSS)
+  ssm: selective_lru_mimo
   ssm_params:
     discretization: IMEX   # 'IM' or 'IMEX'      (linoss only)
     damping: true          # damped IMEX (ignored when discretization='IM')

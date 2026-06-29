@@ -13,8 +13,7 @@ from mamba_ssm.modules.mamba3 import Mamba3
 from mamba_ssm.ops.triton.layer_norm import RMSNorm
 
 from models.linoss import LinOSS
-from models.selective_lru import SelectiveLRU
-from selective_lru import SelectiveLRUMIMO
+from models.selective_lru import SelectiveLRU, SelectiveLRUMIMO
 from models.s4d.s4d import S4DCore
 from models.s5.s5 import S5
 from models.mixer import MambaStyleMixer
@@ -124,7 +123,7 @@ def create_block(
             causal_conv=model_cfg.get("causal_conv", True),
         )
 
-    elif ssm == "selective_linoss":
+    elif ssm == "selective_lru_mimo":
         ssm = SelectiveLRUMIMO(
             in_features=expand * d_model,
             state_dim=d_state,
@@ -142,7 +141,7 @@ def create_block(
             causal_conv=model_cfg.get("causal_conv", True),
         )
 
-    elif ssm == "mamboss6":
+    elif ssm == "selective_lru":
         ssm = SelectiveLRU(
             d_model=expand * d_model,
             d_state=d_state,

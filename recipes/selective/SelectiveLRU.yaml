@@ -66,21 +66,13 @@ model_cfg:
   input_channel: 2 # Magnitude and Phase
   output_channel: 1  # Single Channel Speech Enhancement
 
-  d_state: 16  # Oscillator modes PER CHANNEL (state_dim).
+  d_state: 8  # Oscillator modes PER CHANNEL (state_dim).
   d_conv: 4  # Convolutional layer dimensionality within the Mamba-style surround.
   expand: 4  # Expansion factor; the SSM runs on expand*hid_feature channels.
   norm_epsilon: 0.00001  # Numerical stability in normalization layers.
   causal_conv: true      # causal depthwise conv before the SSM
 
-  # MambOSS6: per-channel (SISO) oscillatory selective SSM with Mamba's S6 factorization
-  # (shared low-rank selective B/C, decoupled low-rank nu/theta time-steps).
-  #
-  # MEMORY: with use_triton (default) the fused mamboss6_triton kernel keeps the
-  # per-channel state off HBM -- forward streams it in registers, backward recomputes it
-  # in chunk_size-wide chunks -- so peak memory is ~10x lower (~4.7 GB vs ~49 GB for one
-  # 1 s clip at state_dim=16). use_triton: false falls back to the materialized reference
-  # path (CPU/testing only). See the MambOSS6 note in CLAUDE.md.
-  ssm: mamboss6
+  ssm: selective_lru
   ssm_params:
     dt_rank:               # low-rank bottleneck for the nu/theta time-steps; null -> ceil(in_features/64)
     dt_min: 0.001          # baseline damping time-step band lower bound (Mamba-style)
