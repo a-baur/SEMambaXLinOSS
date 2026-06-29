@@ -1,28 +1,3 @@
-"""Triton-accelerated S-LinOSS selective scan with custom autograd.
-
-Replaces the sequential Python ``for t in range(T)`` loop in
-``models.linoss.selective_linoss._selective_recurrence`` with a fused Triton
-kernel. The recurrence is the complex selective-LRU mode
-
-    h_k = lambda_k * h_{k-1} + (Bu)_k,    h_{-1} = 0,
-
-with a *time-varying complex* coefficient ``lambda_k = nu_k * exp(i theta_k)``.
-
-Backward. With a real loss ``L`` and per-step upstream gradient ``g_k`` (PyTorch's
-complex-grad convention, ``g_k = dL/dRe(h_k) + i dL/dIm(h_k)``), the adjoint of the
-recurrence is a reverse complex scan
-
-    G_k   = g_k + conj(lambda_{k+1}) * G_{k+1},    G_T = 0
-    dBu_k = G_k
-    dlam_k = G_k * conj(h_{k-1})                   (h_{-1} = 0)
-
-Because ``lambda_k`` and ``(Bu)_k`` carry one independent gradient per ``(b, t, n)``
-element, no cross-time reduction (and hence no ``atomic_add``) is needed — contrast
-the LTI ``LinOSS`` kernel, whose shared real transition ``M`` accumulates ``dM`` over
-time. Triton has no native complex64, so real and imaginary parts are passed as
-separate float32 tensors and the complex multiplies are written out explicitly.
-"""
-
 from __future__ import annotations
 
 import torch
