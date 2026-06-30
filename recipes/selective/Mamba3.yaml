@@ -2,7 +2,7 @@
 # These settings specify the hardware and distributed setup for the model training.
 # Adjust `num_gpus` and `dist_config` according to your distributed training environment.
 env_setting:
-  num_gpus: 3  # Number of GPUs. Now we don't support CPU mode.
+  num_gpus: 2  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 16  # Number of worker threads for data loading.
   val_num_workers: 4  # Worker threads for the (rank-0-only) validation loader.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
