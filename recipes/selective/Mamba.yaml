@@ -31,7 +31,7 @@ data_cfg:
 training_cfg:
   training_epochs: 200 # Training epoch.
   batch_size: 12  # Training batch size.
-  val_batch_size: 8  # Validation batch size (utterances are padded then cropped back). Raise to keep high-latency GPUs (e.g. A40) busy; 1 reproduces the old per-utterance behaviour.
+  val_batch_size: 12  # Validation batch size 
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
   adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.
