@@ -90,6 +90,8 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
 
     with torch.no_grad():
         for j, batch in enumerate(validation_loader):
+            print(f"BATCH{j}")
+            print("loading data...")
             clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch
             clean_audio = clean_audio.to(device, non_blocking=True)
             clean_mag = clean_mag.to(device, non_blocking=True)
@@ -97,17 +99,21 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             clean_com = clean_com.to(device, non_blocking=True)
             noisy_mag = noisy_mag.to(device, non_blocking=True)
             noisy_pha = noisy_pha.to(device, non_blocking=True)
-
+            print("generating...")
             mag_g, pha_g, com_g = model(noisy_mag, noisy_pha)
+
+            print("ISTFT")
             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
             min_len = min(clean_audio.size(-1), audio_g.size(-1))
 
+            print("computing metrics")
             m = evaluator.compute(
                 clean_audio[..., :min_len],
                 audio_g[..., :min_len],
                 exclude=("nisqa", "estoi", "distillmos", "sisdr", "lsd"),
             )
 
+            print("visualize samples...")
             # Log a handful of example utterances as waveforms / spectrograms
             # (rank 0 only -- it is the only rank with a SummaryWriter).
             if sw is not None and j < num_viz_samples:
@@ -130,6 +136,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                     max_seconds=viz_max_seconds,
                 )
 
+            print("compute losses")
             ip, gd, iaf = phase_losses(clean_pha, pha_g, cfg)
             val_metrics["Phase Loss"] += (ip + gd + iaf).item()
             val_metrics["Magnitude Loss"] += F.mse_loss(clean_mag, mag_g).item()
@@ -148,7 +155,6 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
     n_total = max(totals[-1].item(), 1.0)
     averaged = {k: (totals[i] / n_total).item() for i, k in enumerate(keys)}
-
     best_pesq, best_pesq_step, best_utmos, best_utmos_step = best
     log_str = "VALIDATION"
     for metric in keys:

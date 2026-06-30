@@ -42,7 +42,9 @@ class Evaluator:
             fs=sr, mode="wb", n_processes=pesq_n_processes
         )
         self._utmos = torch.hub.load(
-            "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
+            repo_or_dir="/home/hpc/f102ac/f102ac13/dev/SEMambaXLinOSS/SpeechMOS",
+            model="utmos22_strong",
+            source="local",
         ).eval()
         self._nisqa = NonIntrusiveSpeechQualityAssessment(sr)
         self._sisdr = ScaleInvariantSignalDistortionRatio()
