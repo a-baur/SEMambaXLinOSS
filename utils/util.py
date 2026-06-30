@@ -3,6 +3,7 @@ import torch
 import os
 import shutil
 import glob
+from datetime import timedelta
 from torch.distributed import init_process_group
 
 def get_cuda_devices() -> list[str]:
@@ -47,12 +48,21 @@ def initialize_seed(seed):
         torch.cuda.manual_seed(seed)
 
 def initialize_process_group(cfg, rank):
-    """Initialize the process group for distributed training."""
+    """Initialize the process group for distributed training.
+
+    The collective timeout is bumped well above the NCCL default (10 min) because
+    validation runs on rank 0 only: while it scores the full val set, the other
+    ranks block at the next training collective, and a long pass on a slow machine
+    would otherwise trip the watchdog. Override via
+    ``env_setting.dist_cfg.timeout_seconds``.
+    """
+    timeout_s = cfg['env_setting']['dist_cfg'].get('timeout_seconds', 3600)
     init_process_group(
         backend=cfg['env_setting']['dist_cfg']['dist_backend'],
         init_method=cfg['env_setting']['dist_cfg']['dist_url'],
         world_size=cfg['env_setting']['dist_cfg']['world_size'] * cfg['env_setting']['num_gpus'],
-        rank=rank
+        rank=rank,
+        timeout=timedelta(seconds=timeout_s),
     )
 
 def log_model_info(rank, model, exp_path):

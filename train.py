@@ -47,11 +47,14 @@ torch.backends.cudnn.allow_tf32 = True
 def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, stft_params, best):
     """Run the rank-0 validation pass, log averaged metrics, and return updated bests.
 
-    Every utterance is scored at its full native length: the batched, right-padded
-    loader is unpacked and each utterance is cropped back to its true frame / sample
-    count before the generator and every metric see it, so neither the 2 s training
-    window nor the batch padding ever reaches the model or the scores. ``best`` is
-    the running ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated.
+    Each utterance is scored at its full native length, one at a time (the loader
+    yields ``batch_size=1``, ``split=False`` items). Only the original metric set
+    (magnitude / phase / complex losses + PESQ / MR-STFT / UTMOS) is computed here;
+    the heavier neural / CPU metrics (DistillMOS, SI-SDR, LSD, NISQA, eSTOI) are
+    left to ``evaluate.py`` so the in-training pass stays short -- a long rank-0
+    validation otherwise trips the DDP collective-timeout watchdog on the other
+    ranks. ``best`` is the running ``(pesq, pesq_step, utmos, utmos_step)`` tuple,
+    returned updated.
     """
     n_fft, hop_size, win_size, compress_factor = stft_params
     sr = cfg["stft_cfg"]["sampling_rate"]
@@ -61,7 +64,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
     generator.eval()
     torch.cuda.empty_cache()
 
-    val_sums = dict.fromkeys(
+    val_metrics = dict.fromkeys(
         (
             "Magnitude Loss",
             "Phase Loss",
@@ -69,26 +72,14 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             "PESQ Score",
             "MultiResSTFT Loss",
             "UTMOS Score",
-            "DistillMOS Score",
-            "SI-SDR",
-            "LSD",
         ),
         0.0,
     )
-    n_utts, viz_done = 0, 0
+    n_utts = 0
 
     with torch.no_grad():
-        for batch in validation_loader:
-            (
-                clean_audio,
-                clean_mag,
-                clean_pha,
-                clean_com,
-                noisy_mag,
-                noisy_pha,
-                frame_lens,
-                audio_lens,
-            ) = batch
+        for j, batch in enumerate(validation_loader):
+            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch
             clean_audio = clean_audio.to(device, non_blocking=True)
             clean_mag = clean_mag.to(device, non_blocking=True)
             clean_pha = clean_pha.to(device, non_blocking=True)
@@ -96,67 +87,52 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             noisy_mag = noisy_mag.to(device, non_blocking=True)
             noisy_pha = noisy_pha.to(device, non_blocking=True)
 
-            # Score one full-length utterance at a time. Cropping each item back to
-            # its true length before the generator keeps the batch padding out of the
-            # (bidirectional) model entirely -- nothing it never produced reaches the
-            # metrics, and the whole utterance, not a 2 s window, is enhanced.
-            for b in range(clean_audio.size(0)):
-                fl, al = frame_lens[b], audio_lens[b]
-                nm = noisy_mag[b : b + 1, :, :fl]
-                npa = noisy_pha[b : b + 1, :, :fl]
-                cm = clean_mag[b : b + 1, :, :fl]
-                cp = clean_pha[b : b + 1, :, :fl]
-                cc = clean_com[b : b + 1, :, :fl]
-                ca = clean_audio[b : b + 1, :al]
+            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
+            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+            min_len = min(clean_audio.size(-1), audio_g.size(-1))
 
-                mag_g, pha_g, com_g = generator(nm, npa)
-                audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
-                min_len = min(ca.size(-1), audio_g.size(-1))
+            m = evaluator.compute(
+                clean_audio[..., :min_len],
+                audio_g[..., :min_len],
+                exclude=("nisqa", "estoi", "distillmos", "sisdr", "lsd"),
+            )
 
-                ip, gd, iaf = phase_losses(cp, pha_g, cfg)
-                m = evaluator.compute(
-                    ca[..., :min_len], audio_g[..., :min_len], exclude=("nisqa", "estoi")
+            # Log a handful of example utterances as waveforms / spectrograms.
+            if j < num_viz_samples:
+                noisy_audio = mag_phase_istft(
+                    noisy_mag, noisy_pha, n_fft, hop_size, win_size, compress_factor
+                )
+                log_audio_and_spectrograms(
+                    sw,
+                    j,
+                    steps,
+                    sr,
+                    hop_size,
+                    compress_factor,
+                    clean_audio,
+                    noisy_audio,
+                    audio_g,
+                    clean_mag,
+                    noisy_mag,
+                    mag_g,
+                    max_seconds=viz_max_seconds,
                 )
 
-                val_sums["Phase Loss"] += (ip + gd + iaf).item()
-                val_sums["Magnitude Loss"] += F.mse_loss(cm, mag_g).item()
-                val_sums["Complex Loss"] += F.mse_loss(cc, com_g).item()
-                val_sums["PESQ Score"] += m.pesq
-                val_sums["MultiResSTFT Loss"] += m.mrstft
-                val_sums["UTMOS Score"] += m.utmos
-                val_sums["DistillMOS Score"] += m.distillmos
-                val_sums["SI-SDR"] += m.sisdr
-                val_sums["LSD"] += m.lsd
-                n_utts += 1
-
-                # Log a handful of example utterances as waveforms / spectrograms.
-                if viz_done < num_viz_samples:
-                    noisy_audio = mag_phase_istft(
-                        nm, npa, n_fft, hop_size, win_size, compress_factor
-                    )
-                    log_audio_and_spectrograms(
-                        sw,
-                        viz_done,
-                        steps,
-                        sr,
-                        hop_size,
-                        compress_factor,
-                        ca,
-                        noisy_audio,
-                        audio_g,
-                        cm,
-                        nm,
-                        mag_g,
-                        max_seconds=viz_max_seconds,
-                    )
-                    viz_done += 1
+            ip, gd, iaf = phase_losses(clean_pha, pha_g, cfg)
+            val_metrics["Phase Loss"] += (ip + gd + iaf).item()
+            val_metrics["Magnitude Loss"] += F.mse_loss(clean_mag, mag_g).item()
+            val_metrics["Complex Loss"] += F.mse_loss(clean_com, com_g).item()
+            val_metrics["PESQ Score"] += m.pesq
+            val_metrics["MultiResSTFT Loss"] += m.mrstft
+            val_metrics["UTMOS Score"] += m.utmos
+            n_utts += 1
 
     # Average across utterances.
-    val_metrics = {k: v / max(n_utts, 1) for k, v in val_sums.items()}
-
+    n_utts = max(n_utts, 1)
     best_pesq, best_pesq_step, best_utmos, best_utmos_step = best
     log_str = "VALIDATION"
-    for metric, score in val_metrics.items():
+    for metric, total in val_metrics.items():
+        score = total / n_utts
         sw.add_scalar(f"Validation/{metric}", score, steps)
         log_str += f" | {metric}: {score:.4f}"
 
@@ -291,58 +267,20 @@ def create_dataset(cfg, train=True, split=True, device="cuda:0"):
     )
 
 
-def collate_pad(batch):
-    """Pad a list of variable-length validation utterances into a batch.
-
-    __getitem__ (split=False) returns squeezed, full-length tensors:
-        clean_audio [T], mag/pha [F, Tf], com [F, Tf, 2], noisy mag/pha [F, Tf].
-    We right-pad audio to the batch's max sample count and the spectral tensors
-    to the max frame count, and return the true per-item lengths so the
-    validation loop can crop back before computing any metric (padding must not
-    leak into the scores).
-    """
-    audio_lens = [b[0].size(-1) for b in batch]
-    frame_lens = [b[1].size(-1) for b in batch]
-    t_max, f_max = max(audio_lens), max(frame_lens)
-
-    pad_time = lambda x: F.pad(x, (0, f_max - x.size(-1)))  # [F, Tf] -> [F, f_max]
-    pad_com = lambda x: F.pad(x, (0, 0, 0, f_max - x.size(-2)))  # [F, Tf, 2] (pad Tf)
-
-    clean_audio = torch.stack([F.pad(b[0], (0, t_max - b[0].size(-1))) for b in batch])
-    clean_mag = torch.stack([pad_time(b[1]) for b in batch])
-    clean_pha = torch.stack([pad_time(b[2]) for b in batch])
-    clean_com = torch.stack([pad_com(b[3]) for b in batch])
-    noisy_mag = torch.stack([pad_time(b[4]) for b in batch])
-    noisy_pha = torch.stack([pad_time(b[5]) for b in batch])
-    return (
-        clean_audio,
-        clean_mag,
-        clean_pha,
-        clean_com,
-        noisy_mag,
-        noisy_pha,
-        frame_lens,
-        audio_lens,
-    )
-
-
 def create_dataloader(dataset, cfg, train=True):
     """Create dataloader based on dataset and configuration."""
     if not train:
         # Validation runs on rank 0 only, so no DistributedSampler (that would
-        # silently shard the val set across ranks that never run). Batch the
-        # utterances (padded) to keep the GPU busy -- at batch_size=1 the
-        # per-op launch/sync latency dominates on high-latency GPUs (e.g. A40).
+        # silently shard the val set across ranks that never run). One full-length
+        # utterance per step (batch_size=1, the dataset is built with split=False).
         return DataLoader(
             dataset,
-            num_workers=cfg["env_setting"].get("val_num_workers", 4),
-            persistent_workers=True,
+            num_workers=1,
             shuffle=False,
             sampler=None,
-            batch_size=cfg["training_cfg"].get("val_batch_size", 4),
+            batch_size=1,
             pin_memory=True,
             drop_last=False,
-            collate_fn=collate_pad,
         )
 
     if cfg["env_setting"]["num_gpus"] > 1:
