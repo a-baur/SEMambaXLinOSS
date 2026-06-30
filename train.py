@@ -8,6 +8,7 @@ import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.optim as optim
@@ -45,23 +46,33 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, stft_params, best):
-    """Run the rank-0 validation pass, log averaged metrics, and return updated bests.
+    """Run the (sharded) validation pass, log averaged metrics, and return updated bests.
 
-    Each utterance is scored at its full native length, one at a time (the loader
-    yields ``batch_size=1``, ``split=False`` items). Only the original metric set
-    (magnitude / phase / complex losses + PESQ / MR-STFT / UTMOS) is computed here;
-    the heavier neural / CPU metrics (DistillMOS, SI-SDR, LSD, NISQA, eSTOI) are
-    left to ``evaluate.py`` so the in-training pass stays short -- a long rank-0
-    validation otherwise trips the DDP collective-timeout watchdog on the other
-    ranks. ``best`` is the running ``(pesq, pesq_step, utmos, utmos_step)`` tuple,
-    returned updated.
+    Called on every rank: each rank scores its disjoint shard of the validation set
+    (``validation_loader`` is already strided per rank) one full-length utterance at
+    a time, then the per-rank metric sums and counts are all-reduced so every rank
+    derives the same averages. Spreading the work across ranks keeps them all busy
+    instead of leaving ranks>0 idling at the next training collective while rank 0
+    validates -- that idle wait is what tripped the NCCL watchdog.
+
+    Only the original metric set (magnitude / phase / complex losses + PESQ / MR-STFT
+    / UTMOS) is computed; the heavier neural / CPU metrics (DistillMOS, SI-SDR, LSD,
+    NISQA, eSTOI) are left to ``evaluate.py``. Only rank 0 (the one with ``sw``) logs
+    scalars / example spectrograms and prints. ``best`` is the running
+    ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated (identically on
+    every rank, since it is derived from the reduced totals).
     """
     n_fft, hop_size, win_size, compress_factor = stft_params
     sr = cfg["stft_cfg"]["sampling_rate"]
     num_viz_samples = cfg["env_setting"].get("num_viz_samples", 5)
     viz_max_seconds = cfg["env_setting"].get("viz_max_seconds", 5.0)
 
-    generator.eval()
+    # Use the unwrapped module: shards differ in length (e.g. 211/211/210 over 632),
+    # so going through the DDP wrapper would fire its per-forward buffer broadcast a
+    # different number of times per rank and deadlock. The only collective here is
+    # the single all-reduce of the metric sums below, which every rank reaches once.
+    model = generator.module if isinstance(generator, DistributedDataParallel) else generator
+    model.eval()
     torch.cuda.empty_cache()
 
     val_metrics = dict.fromkeys(
@@ -87,7 +98,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             noisy_mag = noisy_mag.to(device, non_blocking=True)
             noisy_pha = noisy_pha.to(device, non_blocking=True)
 
-            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
+            mag_g, pha_g, com_g = model(noisy_mag, noisy_pha)
             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
             min_len = min(clean_audio.size(-1), audio_g.size(-1))
 
@@ -97,8 +108,9 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                 exclude=("nisqa", "estoi", "distillmos", "sisdr", "lsd"),
             )
 
-            # Log a handful of example utterances as waveforms / spectrograms.
-            if j < num_viz_samples:
+            # Log a handful of example utterances as waveforms / spectrograms
+            # (rank 0 only -- it is the only rank with a SummaryWriter).
+            if sw is not None and j < num_viz_samples:
                 noisy_audio = mag_phase_istft(
                     noisy_mag, noisy_pha, n_fft, hop_size, win_size, compress_factor
                 )
@@ -127,13 +139,22 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             val_metrics["UTMOS Score"] += m.utmos
             n_utts += 1
 
-    # Average across utterances.
-    n_utts = max(n_utts, 1)
+    # Reduce per-rank sums + counts into global totals so every rank computes the
+    # same averages over the whole validation set. dict order is identical across
+    # ranks (same code), so the packed tensor layout matches for the all-reduce.
+    keys = list(val_metrics)
+    totals = torch.tensor([val_metrics[k] for k in keys] + [float(n_utts)], device=device)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    n_total = max(totals[-1].item(), 1.0)
+    averaged = {k: (totals[i] / n_total).item() for i, k in enumerate(keys)}
+
     best_pesq, best_pesq_step, best_utmos, best_utmos_step = best
     log_str = "VALIDATION"
-    for metric, total in val_metrics.items():
-        score = total / n_utts
-        sw.add_scalar(f"Validation/{metric}", score, steps)
+    for metric in keys:
+        score = averaged[metric]
+        if sw is not None:
+            sw.add_scalar(f"Validation/{metric}", score, steps)
         log_str += f" | {metric}: {score:.4f}"
 
         if metric == "PESQ Score":
@@ -145,8 +166,9 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                 best_utmos, best_utmos_step = score, steps
             log_str += f" (max. {best_utmos:.4f} @ {best_utmos_step} steps)"
 
-    print(log_str)
-    generator.train()
+    if sw is not None:  # rank 0 only
+        print(log_str)
+    model.train()
     return best_pesq, best_pesq_step, best_utmos, best_utmos_step
 
 
@@ -267,17 +289,21 @@ def create_dataset(cfg, train=True, split=True, device="cuda:0"):
     )
 
 
-def create_dataloader(dataset, cfg, train=True):
+def create_dataloader(dataset, cfg, train=True, rank=0, world_size=1):
     """Create dataloader based on dataset and configuration."""
     if not train:
-        # Validation runs on rank 0 only, so no DistributedSampler (that would
-        # silently shard the val set across ranks that never run). One full-length
-        # utterance per step (batch_size=1, the dataset is built with split=False).
+        # Shard the (full-length) validation set across ranks: this rank scores the
+        # strided slice [rank, rank+world_size, ...], one utterance per step
+        # (batch_size=1, the dataset is built with split=False). A plain index list
+        # is used rather than DistributedSampler because the latter pads short shards
+        # with duplicate samples, which would bias the averaged validation metrics;
+        # the strided list is exact and lets workers load only this rank's utterances.
+        shard = list(range(rank, len(dataset), world_size))
         return DataLoader(
             dataset,
             num_workers=1,
             shuffle=False,
-            sampler=None,
+            sampler=shard,
             batch_size=1,
             pin_memory=True,
             drop_last=False,
@@ -324,11 +350,12 @@ def train(rank, args, cfg):
     generator = SEMamba(cfg).to(device)
     discriminator = MetricDiscriminator().to(device)
 
+    # Every rank validates a shard of the val set (see create_dataloader), so every
+    # rank needs an evaluator. Validation scores one utterance at a time, so PESQ is
+    # fed batch_size=1: keep n_processes=1, since forking a multiprocessing pool per
+    # single utterance is ~60x slower than the sequential path (see Evaluator).
+    evaluator = Evaluator(sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=1).to(device)
     if rank == 0:
-        # Validation runs PESQ over a real batch, so parallelize across it.
-        evaluator = Evaluator(
-            sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=os.cpu_count() or 1
-        ).to(device)
         log_model_info(rank, generator, args.exp_path)
 
     state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)
@@ -354,10 +381,19 @@ def train(rank, args, cfg):
     trainset = create_dataset(cfg, train=True, split=True, device=device)
     train_loader = create_dataloader(trainset, cfg, train=True)
 
-    # Create validset and validation_loader if rank is 0
+    # Create the validation set on every rank and shard it across ranks: each rank
+    # scores a disjoint slice of utterances (see create_dataloader), so all ranks
+    # stay busy during validation instead of ranks>0 idling at the next training
+    # collective while rank 0 validates -- that idle wait is what tripped the NCCL
+    # watchdog. The per-rank metric sums are all-reduced in validate().
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    validset = create_dataset(cfg, train=False, split=False, device=device)
+    validation_loader = create_dataloader(
+        validset, cfg, train=False, rank=rank, world_size=world_size
+    )
+    # Only rank 0 owns the TensorBoard / wandb writer.
+    sw = None
     if rank == 0:
-        validset = create_dataset(cfg, train=False, split=False, device=device)
-        validation_loader = create_dataloader(validset, cfg, train=False)
         wandb.init(
             project="SEMambaXLinOSS",
             name=args.exp_name,
@@ -527,19 +563,22 @@ def train(rank, args, cfg):
                 if torch.isnan(loss_gen_all).any():
                     raise ValueError("NaN values found in loss_gen_all")
 
-                # Validation
-                if steps % cfg["env_setting"]["validation_interval"] == 0 and steps != 0:
-                    best_pesq, best_pesq_step, best_utmos, best_utmos_step = validate(
-                        generator,
-                        evaluator,
-                        validation_loader,
-                        cfg,
-                        device,
-                        sw,
-                        steps,
-                        (n_fft, hop_size, win_size, compress_factor),
-                        (best_pesq, best_pesq_step, best_utmos, best_utmos_step),
-                    )
+            # Validation runs on EVERY rank (each scores a shard and the metric sums
+            # are all-reduced), so it sits outside the rank-0 block -- all ranks must
+            # hit the same collectives in lockstep. steps advances identically on
+            # every rank (DistributedSampler + drop_last), so this fires in sync.
+            if steps % cfg["env_setting"]["validation_interval"] == 0 and steps != 0:
+                best_pesq, best_pesq_step, best_utmos, best_utmos_step = validate(
+                    generator,
+                    evaluator,
+                    validation_loader,
+                    cfg,
+                    device,
+                    sw,
+                    steps,
+                    (n_fft, hop_size, win_size, compress_factor),
+                    (best_pesq, best_pesq_step, best_utmos, best_utmos_step),
+                )
 
             steps += 1
 
