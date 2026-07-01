@@ -13,11 +13,13 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.optim as optim
 import wandb
-from dataloaders.dataloader_vctk import VCTKDemandDataset
+from functools import partial
+from tqdm import tqdm
+
+from dataloaders.dataloader_vctk import VCTKDemandDataset, crop_collate_valid
 from models.discriminator import MetricDiscriminator, batch_pesq
 from models.generator import SEMamba
 from models.linoss.linoss import LinOSS
-from models.selective_lru import SelectiveLRU, SelectiveLRUMIMO
 from models.loss import phase_losses
 from models.s4d.s4d import S4DKernel
 from models.s5.s5 import S5SSM
@@ -69,8 +71,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
 
     # Use the unwrapped module: shards differ in length (e.g. 211/211/210 over 632),
     # so going through the DDP wrapper would fire its per-forward buffer broadcast a
-    # different number of times per rank and deadlock. The only collective here is
-    # the single all-reduce of the metric sums below, which every rank reaches once.
+    # different number of times per rank and deadlock.
     model = generator.module if isinstance(generator, DistributedDataParallel) else generator
     model.eval()
     torch.cuda.empty_cache()
@@ -88,67 +89,73 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
     )
     n_utts = 0
 
-    with torch.no_grad():
-        for j, batch in enumerate(validation_loader):
-            print(f"BATCH{j}")
-            print("loading data...")
-            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch
-            clean_audio = clean_audio.to(device, non_blocking=True)
-            clean_mag = clean_mag.to(device, non_blocking=True)
-            clean_pha = clean_pha.to(device, non_blocking=True)
-            clean_com = clean_com.to(device, non_blocking=True)
-            noisy_mag = noisy_mag.to(device, non_blocking=True)
-            noisy_pha = noisy_pha.to(device, non_blocking=True)
-            print("generating...")
-            mag_g, pha_g, com_g = model(noisy_mag, noisy_pha)
+    # Progress bar on rank 0 only (the rank that owns the SummaryWriter); other ranks
+    # score their shard silently so the terminal isn't spammed with one bar per GPU.
+    pbar = tqdm(
+        validation_loader,
+        desc=f"Validation @ {steps} steps",
+        unit="batch",
+        disable=False,  # sw is None,
+        dynamic_ncols=True,
+        leave=False,
+    )
 
-            print("ISTFT")
+    with torch.no_grad():
+        for batch in pbar:
+            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = (
+                t.to(device, non_blocking=True) for t in batch
+            )
+            b = clean_audio.size(0)
+
+            mag_g, pha_g, com_g = model(noisy_mag, noisy_pha)
             audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
             min_len = min(clean_audio.size(-1), audio_g.size(-1))
 
-            print("computing metrics")
-            m = evaluator.compute(
-                clean_audio[..., :min_len],
-                audio_g[..., :min_len],
-                exclude=("nisqa", "estoi", "distillmos", "sisdr", "lsd"),
+            # Batched PESQ (CPU pool across the batch) and UTMOS (GPU) run concurrently.
+            pesq, mrstft, utmos = evaluator.compute_val(
+                clean_audio[..., :min_len], audio_g[..., :min_len]
             )
 
-            print("visualize samples...")
             # Log a handful of example utterances as waveforms / spectrograms
-            # (rank 0 only -- it is the only rank with a SummaryWriter).
-            if sw is not None and j < num_viz_samples:
+            if sw is not None and n_utts < num_viz_samples:
                 noisy_audio = mag_phase_istft(
                     noisy_mag, noisy_pha, n_fft, hop_size, win_size, compress_factor
                 )
-                log_audio_and_spectrograms(
-                    sw,
-                    j,
-                    steps,
-                    sr,
-                    hop_size,
-                    compress_factor,
-                    clean_audio,
-                    noisy_audio,
-                    audio_g,
-                    clean_mag,
-                    noisy_mag,
-                    mag_g,
-                    max_seconds=viz_max_seconds,
-                )
+                for i in range(min(b, num_viz_samples - n_utts)):
+                    log_audio_and_spectrograms(
+                        sw,
+                        n_utts + i,
+                        steps,
+                        sr,
+                        hop_size,
+                        compress_factor,
+                        clean_audio[i : i + 1],
+                        noisy_audio[i : i + 1],
+                        audio_g[i : i + 1],
+                        clean_mag[i : i + 1],
+                        noisy_mag[i : i + 1],
+                        mag_g[i : i + 1],
+                        max_seconds=viz_max_seconds,
+                    )
 
-            print("compute losses")
             ip, gd, iaf = phase_losses(clean_pha, pha_g, cfg)
-            val_metrics["Phase Loss"] += (ip + gd + iaf).item()
-            val_metrics["Magnitude Loss"] += F.mse_loss(clean_mag, mag_g).item()
-            val_metrics["Complex Loss"] += F.mse_loss(clean_com, com_g).item()
-            val_metrics["PESQ Score"] += m.pesq
-            val_metrics["MultiResSTFT Loss"] += m.mrstft
-            val_metrics["UTMOS Score"] += m.utmos
-            n_utts += 1
+            val_metrics["Phase Loss"] += (ip + gd + iaf).item() * b
+            val_metrics["Magnitude Loss"] += F.mse_loss(clean_mag, mag_g).item() * b
+            val_metrics["Complex Loss"] += F.mse_loss(clean_com, com_g).item() * b
+            val_metrics["PESQ Score"] += pesq * b
+            val_metrics["MultiResSTFT Loss"] += mrstft * b
+            val_metrics["UTMOS Score"] += utmos * b
+            n_utts += b
 
-    # Reduce per-rank sums + counts into global totals so every rank computes the
-    # same averages over the whole validation set. dict order is identical across
-    # ranks (same code), so the packed tensor layout matches for the all-reduce.
+            # Live running means on the rank-0 bar (shard-local until the all-reduce).
+            if sw is not None:
+                pbar.set_postfix(
+                    utts=n_utts,
+                    pesq=val_metrics["PESQ Score"] / n_utts,
+                    utmos=val_metrics["UTMOS Score"] / n_utts,
+                )
+    pbar.close()
+
     keys = list(val_metrics)
     totals = torch.tensor([val_metrics[k] for k in keys] + [float(n_utts)], device=device)
     if dist.is_initialized() and dist.get_world_size() > 1:
@@ -298,21 +305,35 @@ def create_dataset(cfg, train=True, split=True, device="cuda:0"):
 def create_dataloader(dataset, cfg, train=True, rank=0, world_size=1):
     """Create dataloader based on dataset and configuration."""
     if not train:
-        # Shard the (full-length) validation set across ranks: this rank scores the
-        # strided slice [rank, rank+world_size, ...], one utterance per step
-        # (batch_size=1, the dataset is built with split=False). A plain index list
-        # is used rather than DistributedSampler because the latter pads short shards
-        # with duplicate samples, which would bias the averaged validation metrics;
-        # the strided list is exact and lets workers load only this rank's utterances.
-        shard = list(range(rank, len(dataset), world_size))
+        n = len(dataset)
+        max_valid = cfg["env_setting"].get("max_valid_samples")
+        if max_valid is not None and max_valid > 0:
+            n = min(n, int(max_valid))
+
+        shard = list(range(rank, n, world_size))
+        val_batch_size = cfg["training_cfg"].get("val_batch_size", 1)
+        val_num_workers = cfg["env_setting"].get("val_num_workers", 1)
+        crop_seconds = cfg["training_cfg"].get("valid_crop_seconds", 4.0)
+        sr = cfg["stft_cfg"]["sampling_rate"]
+        hop = cfg["stft_cfg"]["hop_size"]
+        crop_samples = int(round(crop_seconds * sr))
+        crop_frames = crop_samples // hop + 1  # center=True STFT frame count for that window
+        collate = partial(
+            crop_collate_valid, crop_samples=crop_samples, crop_frames=crop_frames
+        )
         return DataLoader(
             dataset,
-            num_workers=1,
+            num_workers=val_num_workers,
             shuffle=False,
             sampler=shard,
-            batch_size=1,
+            batch_size=val_batch_size,
+            collate_fn=collate,
             pin_memory=True,
             drop_last=False,
+            persistent_workers=val_num_workers > 0,
+            prefetch_factor=cfg["env_setting"].get("val_prefetch_factor", 2)
+            if val_num_workers > 0
+            else None,
         )
 
     if cfg["env_setting"]["num_gpus"] > 1:
@@ -356,11 +377,11 @@ def train(rank, args, cfg):
     generator = SEMamba(cfg).to(device)
     discriminator = MetricDiscriminator().to(device)
 
-    # Every rank validates a shard of the val set (see create_dataloader), so every
-    # rank needs an evaluator. Validation scores one utterance at a time, so PESQ is
-    # fed batch_size=1: keep n_processes=1, since forking a multiprocessing pool per
-    # single utterance is ~60x slower than the sequential path (see Evaluator).
-    evaluator = Evaluator(sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=1).to(device)
+    val_batch_size = cfg["training_cfg"].get("val_batch_size", 1)
+    pesq_n_processes = max(1, min(val_batch_size, os.cpu_count() or 1))
+    evaluator = Evaluator(
+        sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=pesq_n_processes
+    ).to(device)
     if rank == 0:
         log_model_info(rank, generator, args.exp_path)
 
@@ -372,6 +393,10 @@ def train(rank, args, cfg):
     if num_gpus > 1 and torch.cuda.is_available():
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
+
+    def unwrap(m):
+        # DDP hides the real module under `.module`; no-op when single-GPU / unwrapped.
+        return m.module if isinstance(m, DistributedDataParallel) else m
 
     if cfg["training_cfg"].get("use_pretrainedD", False):
         discriminator.load_state_dict(torch.load("ckpts/pretrained_discriminator.pth"))
@@ -387,11 +412,7 @@ def train(rank, args, cfg):
     trainset = create_dataset(cfg, train=True, split=True, device=device)
     train_loader = create_dataloader(trainset, cfg, train=True)
 
-    # Create the validation set on every rank and shard it across ranks: each rank
-    # scores a disjoint slice of utterances (see create_dataloader), so all ranks
-    # stay busy during validation instead of ranks>0 idling at the next training
-    # collective while rank 0 validates -- that idle wait is what tripped the NCCL
-    # watchdog. The per-rank metric sums are all-reduced in validate().
+    # Create the validation set on every rank and shard it across ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     validset = create_dataset(cfg, train=False, split=False, device=device)
     validation_loader = create_dataloader(
@@ -428,16 +449,11 @@ def train(rank, args, cfg):
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
+            # [B, F, T]; F = n_fft//2 + 1, T = n_frames
             clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = (
-                batch  # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+                t.to(device, non_blocking=True) for t in batch
             )
-            clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
-            clean_mag = torch.autograd.Variable(clean_mag.to(device, non_blocking=True))
-            clean_pha = torch.autograd.Variable(clean_pha.to(device, non_blocking=True))
-            clean_com = torch.autograd.Variable(clean_com.to(device, non_blocking=True))
-            noisy_mag = torch.autograd.Variable(noisy_mag.to(device, non_blocking=True))
-            noisy_pha = torch.autograd.Variable(noisy_pha.to(device, non_blocking=True))
-            one_labels = torch.ones(batch_size).to(device, non_blocking=True)
+            one_labels = torch.ones(batch_size, device=device)
 
             mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
 
@@ -471,31 +487,27 @@ def train(rank, args, cfg):
             optim_g.zero_grad()
 
             # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
-            # L2 Magnitude Loss
-            loss_mag = F.mse_loss(clean_mag, mag_g)
-            # Anti-wrapping Phase Loss
+            # Unweighted base losses (weights + the complex/consistency x2 applied below).
+            loss_mag = F.mse_loss(clean_mag, mag_g)  # L2 magnitude
             loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
-            loss_pha = loss_ip + loss_gd + loss_iaf
-            # L2 Complex Loss
-            loss_com = F.mse_loss(clean_com, com_g) * 2
-            # Time Loss
-            loss_time = F.l1_loss(clean_audio, audio_g)
-            # Metric Loss
+            loss_pha = loss_ip + loss_gd + loss_iaf  # anti-wrapping phase
+            loss_com = F.mse_loss(clean_com, com_g)  # L2 complex
+            loss_time = F.l1_loss(clean_audio, audio_g)  # time-domain L1
             metric_g = discriminator(clean_mag, mag_g)
-            loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
-            # Consistancy Loss
+            loss_metric = F.mse_loss(metric_g.flatten(), one_labels)  # PESQ-metric
             _, _, rec_com = mag_phase_stft(
                 audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True
             )
-            loss_con = F.mse_loss(com_g, rec_com) * 2
+            loss_con = F.mse_loss(com_g, rec_com)  # STFT-consistency
 
+            loss_w = cfg["training_cfg"]["loss"]
             loss_gen_all = (
-                loss_metric * cfg["training_cfg"]["loss"]["metric"]
-                + loss_mag * cfg["training_cfg"]["loss"]["magnitude"]
-                + loss_pha * cfg["training_cfg"]["loss"]["phase"]
-                + loss_com * cfg["training_cfg"]["loss"]["complex"]
-                + loss_time * cfg["training_cfg"]["loss"]["time"]
-                + loss_con * cfg["training_cfg"]["loss"]["consistancy"]
+                loss_metric * loss_w["metric"]
+                + loss_mag * loss_w["magnitude"]
+                + loss_pha * loss_w["phase"]
+                + loss_com * 2 * loss_w["complex"]
+                + loss_time * loss_w["time"]
+                + loss_con * 2 * loss_w["consistancy"]
             )
 
             loss_gen_all.backward()
@@ -503,50 +515,42 @@ def train(rank, args, cfg):
             # ------------------------------------------------------- #
 
             if rank == 0:
-                # STDOUT logging
+                # STDOUT logging. Reuse the losses already computed for backprop
+                # (unweighted; .item() detaches and forces the one sync we want here).
                 if steps % cfg["env_setting"]["stdout_interval"] == 0:
-                    with torch.no_grad():
-                        metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                        mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        pha_error = (loss_ip + loss_gd + loss_iaf).item()
-                        com_error = F.mse_loss(clean_com, com_g).item()
-                        time_error = F.l1_loss(clean_audio, audio_g).item()
-                        con_error = F.mse_loss(com_g, rec_com).item()
+                    metric_error = loss_metric.item()
+                    mag_error = loss_mag.item()
+                    pha_error = loss_pha.item()
+                    com_error = loss_com.item()
+                    time_error = loss_time.item()
+                    con_error = loss_con.item()
 
-                        print(
-                            "Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, "
-                            "Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}".format(
-                                steps,
-                                loss_gen_all,
-                                loss_disc_all,
-                                metric_error,
-                                mag_error,
-                                pha_error,
-                                com_error,
-                                time_error,
-                                con_error,
-                                time.time() - start_b,
-                            )
+                    print(
+                        "Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, "
+                        "Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}".format(
+                            steps,
+                            loss_gen_all,
+                            loss_disc_all,
+                            metric_error,
+                            mag_error,
+                            pha_error,
+                            com_error,
+                            time_error,
+                            con_error,
+                            time.time() - start_b,
                         )
+                    )
 
                 # Checkpointing
                 if steps % cfg["env_setting"]["checkpoint_interval"] == 0 and steps != 0:
-                    exp_name = f"{args.exp_path}/g_{steps:08d}.pth"
                     save_checkpoint(
-                        exp_name,
-                        {
-                            "generator": (
-                                generator.module if num_gpus > 1 else generator
-                            ).state_dict()
-                        },
+                        f"{args.exp_path}/g_{steps:08d}.pth",
+                        {"generator": unwrap(generator).state_dict()},
                     )
-                    exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
                     save_checkpoint(
-                        exp_name,
+                        f"{args.exp_path}/do_{steps:08d}.pth",
                         {
-                            "discriminator": (
-                                discriminator.module if num_gpus > 1 else discriminator
-                            ).state_dict(),
+                            "discriminator": unwrap(discriminator).state_dict(),
                             "optim_g": optim_g.state_dict(),
                             "optim_d": optim_d.state_dict(),
                             "steps": steps,

@@ -193,3 +193,37 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.noisy_wavs_path)
+
+
+def crop_collate_valid(batch, crop_samples, crop_frames):
+    """Crop each full-length validation utterance to a fixed window and stack.
+
+    ``VCTKDemandDataset`` with ``split=False`` yields full-length utterances, so
+    items in a batch differ in duration. Cropping every item to the same window
+    -- ``crop_samples`` in the time domain, ``crop_frames`` in the STFT domain --
+    yields a uniform, pad-free batch that can be pushed through the model and the
+    metrics in one shot (no padded frames wasting compute or biasing losses, and
+    PESQ/UTMOS can score the whole batch at once). The leading window is taken so
+    the crop is deterministic across runs. Utterances shorter than the window
+    (none in the standard 16 kHz val sets, which are all >= 4 s) are right-padded
+    with zeros as a safety net.
+
+    Returns clean_audio [B, crop_samples], clean_mag/pha/noisy_mag/pha
+    [B, F, crop_frames], clean_com [B, F, crop_frames, 2].
+    """
+    pad = torch.nn.functional.pad
+
+    def fit_last(x, n):  # crop or right-pad the last axis to length n
+        return x[..., :n] if x.size(-1) >= n else pad(x, (0, n - x.size(-1)))
+
+    def fit_com(x, n):  # com is [F, T, 2]; the time axis is dim=1
+        return x[:, :n] if x.size(1) >= n else pad(x, (0, 0, 0, n - x.size(1)))
+
+    clean_audio = torch.stack([fit_last(b[0], crop_samples) for b in batch])
+    clean_mag = torch.stack([fit_last(b[1], crop_frames) for b in batch])
+    clean_pha = torch.stack([fit_last(b[2], crop_frames) for b in batch])
+    clean_com = torch.stack([fit_com(b[3], crop_frames) for b in batch])
+    noisy_mag = torch.stack([fit_last(b[4], crop_frames) for b in batch])
+    noisy_pha = torch.stack([fit_last(b[5], crop_frames) for b in batch])
+
+    return clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha

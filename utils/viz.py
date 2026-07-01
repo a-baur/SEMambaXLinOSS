@@ -2,13 +2,14 @@ import torch
 import matplotlib
 matplotlib.use('Agg')  # headless backend, no display required on training nodes
 from matplotlib import pyplot as plt
+import wandb
 
 
 def log_audio_and_spectrograms(sw, idx, steps, sr, hop_size, compress_factor,
                                clean_audio, noisy_audio, enhanced_audio,
                                clean_mag, noisy_mag, enhanced_mag,
                                log_reference=True, max_seconds=5.0, top_db=80.0):
-    """Log one validation example's waveforms and spectrograms to TensorBoard.
+    """Log one validation example's waveforms and spectrograms to TensorBoard + wandb.
 
     The clean/noisy reference signals are static across training, so they only
     need to be logged once (``log_reference=True``); subsequent validation runs
@@ -17,21 +18,39 @@ def log_audio_and_spectrograms(sw, idx, steps, sr, hop_size, compress_factor,
     the figures readable for long utterances. ``top_db`` fixes the displayed
     dynamic range (dB below each spectrogram's peak) so the magnitude colour
     scale is bounded and comparable across the clean/noisy/enhanced panels.
+
+    Audio is sent to TensorBoard (``sw.add_audio``) and, when a wandb run is
+    active, also natively to wandb (``wandb.Audio``) -- wandb's TensorBoard sync
+    forwards scalars/images but not audio, so the waveforms need an explicit log.
     """
     max_frames = int(max_seconds * sr / hop_size) if max_seconds is not None else None
+    wandb_media = {}
+
+    def _log_audio(name, audio, caption):
+        wav = _peak_normalize(audio)
+        sw.add_audio(f"Audio/{idx}_{name}", wav, steps, sr)
+        if wandb.run is not None:
+            wandb_media[f"Audio/{idx}_{name}"] = wandb.Audio(
+                wav.numpy(), sample_rate=sr, caption=caption
+            )
 
     if log_reference:
-        sw.add_audio(f"Audio/{idx}_clean", _peak_normalize(clean_audio), steps, sr)
-        sw.add_audio(f"Audio/{idx}_noisy", _peak_normalize(noisy_audio), steps, sr)
+        _log_audio("clean", clean_audio, f"clean {idx}")
+        _log_audio("noisy", noisy_audio, f"noisy {idx}")
         clean_fig = _spectrogram_figure(clean_mag.squeeze(), compress_factor, sr, hop_size, "Clean", max_frames, top_db)
         noisy_fig = _spectrogram_figure(noisy_mag.squeeze(), compress_factor, sr, hop_size, "Noisy", max_frames, top_db)
         sw.add_figure(f"Spectrogram/{idx}_clean", clean_fig, steps)
         sw.add_figure(f"Spectrogram/{idx}_noisy", noisy_fig, steps)
 
-    sw.add_audio(f"Audio/{idx}_enhanced", _peak_normalize(enhanced_audio), steps, sr)
+    _log_audio("enhanced", enhanced_audio, f"enhanced {idx} @ {steps} steps")
     enhanced_fig = _spectrogram_figure(enhanced_mag.squeeze(), compress_factor, sr, hop_size, "Enhanced", max_frames, top_db)
     sw.add_figure(f"Spectrogram/{idx}_enhanced", enhanced_fig, steps)
     plt.close('all')
+
+    # One wandb.log per example, keyed to the same global step as the TB-synced
+    # scalars so the audio lines up on the same x-axis.
+    if wandb_media:
+        wandb.log(wandb_media, step=steps)
 
 
 def _peak_normalize(audio):

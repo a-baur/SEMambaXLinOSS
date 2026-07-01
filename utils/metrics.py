@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import distillmos
@@ -14,6 +15,8 @@ from torchmetrics.audio import (
 # STFT used for the log-spectral distance (independent of the model's analysis STFT).
 _LSD_N_FFT = 1024
 _LSD_HOP = 256
+
+HPC_ALEX_SPEECHMOS_PATH = "/home/hpc/f102ac/f102ac13/dev/SEMambaXLinOSS/SpeechMOS"
 
 
 @dataclass
@@ -31,28 +34,53 @@ class EvalMetrics:
 
 class Evaluator:
     def __init__(self, sr, pesq_n_processes=1):
-        # ``pesq_n_processes`` only helps when PESQ is fed a real batch: torchmetrics
-        # then dispatches to ``pesq_batch``, which forks a multiprocessing pool across
-        # the batch dimension. At batch_size=1 (e.g. evaluate.py's per-utterance loop)
-        # it forks/tears down that pool for a single value on every call -- ~60x slower
-        # than the sequential path -- so keep the default at 1 and let the batched
-        # validation loop in train.py opt in.
         self._mrstft = MultiResolutionSTFTLoss(sample_rate=sr)
         self._pesq = PerceptualEvaluationSpeechQuality(
             fs=sr, mode="wb", n_processes=pesq_n_processes
         )
-        self._utmos = torch.hub.load(
-            repo_or_dir="/home/hpc/f102ac/f102ac13/dev/SEMambaXLinOSS/SpeechMOS",
-            model="utmos22_strong",
-            source="local",
-        ).eval()
+        if os.path.exists(HPC_ALEX_SPEECHMOS_PATH):
+            self._utmos = torch.hub.load(
+                repo_or_dir="",
+                model="utmos22_strong",
+                source="local",
+            ).eval()
+        else:
+            self._utmos = torch.hub.load(
+                "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
+            ).eval()
         self._nisqa = NonIntrusiveSpeechQualityAssessment(sr)
         self._sisdr = ScaleInvariantSignalDistortionRatio()
         self._estoi = ShortTimeObjectiveIntelligibility(sr, extended=True)
         self._distillmos = distillmos.ConvTransformerSQAModel().eval()
 
+        self._pesq_executor = ThreadPoolExecutor(max_workers=1)
+
         self._device = torch.device("cpu")
         self._sr = sr
+
+    def _pesq_safe(self, pred, clean):
+        """Batched PESQ mean as a float; -1.0 on the degenerate-utterance error."""
+        try:
+            return self._pesq(pred.cpu(), clean.cpu()).item()
+        except Exception as e:
+            # PESQ raises on silent/degenerate utterances (common early in training).
+            print(f"Error computing PESQ score: {e}")
+            return -1.0
+
+    def compute_val(self, clean, pred):
+        """Fast batched metrics for the in-training validation loop.
+
+        Computes PESQ, MR-STFT and UTMOS for a whole (fixed-length, uniform) batch
+        and returns their batch means as Python floats. PESQ runs on a CPU process
+        pool launched on a background thread, so it overlaps with UTMOS/MR-STFT on
+        the GPU instead of running after them. Returns ``(pesq, mrstft, utmos)``.
+        """
+        # Launch PESQ (CPU) first so its pool spins up while the GPU metrics run.
+        pesq_future = self._pesq_executor.submit(self._pesq_safe, pred, clean)
+        mrstft = self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1)).item()
+        utmos = self._utmos(pred, self._sr).mean().item()
+        pesq = pesq_future.result()
+        return pesq, mrstft, utmos
 
     def _lsd(self, clean, pred):
         """Mean log-spectral distance (dB-free, log10 power) as a 0-dim tensor.
@@ -94,13 +122,7 @@ class Evaluator:
             # Caller computes PESQ separately (e.g. once over the whole pass).
             pesq_score = None
         else:
-            try:
-                # torchmetrics parallelizes across the batch via n_processes.
-                pesq_score = self._pesq(pred, clean).item()
-            except Exception as e:
-                # PESQ raises on silent/degenerate utterances (common early in training)
-                print(f"Error computing PESQ score: {e}")
-                pesq_score = -1.0
+            pesq_score = self._pesq_safe(pred, clean)
 
         utmos_score = self._utmos(pred, self._sr).mean() if keep("utmos") else None
         nisqa_score = self._nisqa(pred)[..., 0].mean() if keep("nisqa") else None
@@ -133,7 +155,7 @@ class Evaluator:
     def to(self, device) -> "Evaluator":
         self._device = torch.device(device)
         self._mrstft.to(device)
-        self._pesq.to(device)
+        # self._pesq stays on CPU (numpy algorithm); see __init__.
         self._utmos.to(device)
         self._nisqa.to(device)
         self._sisdr.to(device)

@@ -96,9 +96,14 @@ def worker(rank, args, cfg):
     if num_gpus > 1 and not args.no_ddp:
         generator = DistributedDataParallel(generator, device_ids=[rank])
 
-    # --- evaluator (per rank). pesq_n_processes=1 because validation scores one
-    # utterance at a time -- a pool per single utterance is ~60x slower. -----------
-    evaluator = Evaluator(sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=1).to(device)
+    # --- evaluator (per rank). Validation scores a whole val_batch_size batch of
+    # fixed-length crops at once, so PESQ forks a pool across the batch (mirrors
+    # train.py) and UTMOS overlaps on the GPU. --------------------------------------
+    val_batch_size = cfg["training_cfg"].get("val_batch_size", 1)
+    pesq_n_processes = max(1, min(val_batch_size, os.cpu_count() or 1))
+    evaluator = Evaluator(
+        sr=cfg["stft_cfg"]["sampling_rate"], pesq_n_processes=pesq_n_processes
+    ).to(device)
 
     # --- sharded validation loader (the REAL create_dataloader) -------------------
     validset = T.create_dataset(cfg, train=False, split=False, device=device)
