@@ -422,7 +422,7 @@ def train(rank, args, cfg):
     sw = None
     if rank == 0:
         wandb.init(
-            project="SEMambaXLinOSS",
+            project="SEMambaBackbones",
             name=args.exp_name,
             dir=args.exp_path,
             config=cfg,
