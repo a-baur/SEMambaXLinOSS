@@ -9,6 +9,7 @@ env_setting:
   stdout_interval: 10
   checkpoint_interval: 1000  # save model to ckpt every N steps
   validation_interval: 1000
+  max_valid_samples: 120
   summary_interval: 100
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
   dist_cfg:
@@ -30,8 +31,10 @@ data_cfg:
 # including batch sizes, learning rates, and optimizer specifics.
 training_cfg:
   training_epochs: 200 # Training epoch.
+  val_batch_size: 24
+  valid_crop_seconds: 6.0
+  max_valid_samples: 64
   batch_size: 12  # Training batch size.
-  val_batch_size: 8  # Validation batch size (utterances are padded then cropped back). Raise to keep high-latency GPUs (e.g. A40) busy; 1 reproduces the old per-utterance behaviour.
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
   adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.
