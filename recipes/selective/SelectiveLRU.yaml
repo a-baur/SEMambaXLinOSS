@@ -10,6 +10,7 @@ env_setting:
   checkpoint_interval: 1000  # save model to ckpt every N steps
   validation_interval: 1000
   summary_interval: 100
+  max_valid_samples: 120
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
