@@ -23,6 +23,7 @@ import warnings
 import librosa
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 
 from dataloaders.dataloader_vctk import (
     _common_root,
@@ -32,6 +33,7 @@ from dataloaders.dataloader_vctk import (
 from utils.metrics import Evaluator
 from utils.util import load_config
 from models.generator import SEMamba
+from models.loss import phase_losses
 from models.stfts import mag_phase_istft, mag_phase_stft
 
 
@@ -171,6 +173,12 @@ def main():
         "sisdr",
         "lsd",
         "estoi",
+        "magnitude",
+        "phase",
+        "phase_ip",
+        "phase_gd",
+        "phase_iaf",
+        "complex",
     )
     sums = {m: 0.0 for m in metric_names}
     counts = {m: 0 for m in metric_names}
@@ -191,6 +199,22 @@ def main():
         # PESQ sentinel from utils/metrics.py on degenerate utterances.
         pesq = float("nan") if metrics.pesq == -1.0 else metrics.pesq
 
+        # Spectral-domain training losses (magnitude / phase / complex), computed in
+        # the same compressed STFT domain as train.py's validation. Both waveforms are
+        # in the un-normalized domain here, so re-analysing them is self-consistent.
+        n_fft = cfg["stft_cfg"]["n_fft"]
+        hop_size = cfg["stft_cfg"]["hop_size"]
+        win_size = cfg["stft_cfg"]["win_size"]
+        compress = cfg["model_cfg"]["compress_factor"]
+        clean_mag, clean_pha, clean_com = mag_phase_stft(
+            clean_b, n_fft, hop_size, win_size, compress
+        )
+        enh_mag, enh_pha, enh_com = mag_phase_stft(
+            enhanced_b, n_fft, hop_size, win_size, compress
+        )
+        ip, gd, iaf = phase_losses(clean_pha, enh_pha, cfg)
+        ip, gd, iaf = ip.item(), gd.item(), iaf.item()
+
         row = {
             "noisy": noisy_path,
             "clean": clean_path,
@@ -202,6 +226,12 @@ def main():
             "sisdr": metrics.sisdr,
             "lsd": metrics.lsd,
             "estoi": metrics.estoi,
+            "magnitude": F.mse_loss(clean_mag, enh_mag).item(),
+            "phase": ip + gd + iaf,
+            "phase_ip": ip,
+            "phase_gd": gd,
+            "phase_iaf": iaf,
+            "complex": F.mse_loss(clean_com, enh_com).item(),
         }
         per_utt.append(row)
         for m in metric_names:
@@ -243,14 +273,7 @@ def main():
         "sampling_rate": sr,
         "num_utterances": len(pairs),
         "valid_counts": counts,
-        "mean_pesq": means["pesq"],
-        "mean_mrstft": means["mrstft"],
-        "mean_utmos": means["utmos"],
-        "mean_distillmos": means["distillmos"],
-        "mean_nisqa": means["nisqa"],
-        "mean_sisdr": means["sisdr"],
-        "mean_lsd": means["lsd"],
-        "mean_estoi": means["estoi"],
+        **{f"mean_{m}": means[m] for m in metric_names},
         "samples_dir": samples_dir,
     }
     out_json = os.path.join(args.output_dir, "metrics.json")
@@ -267,6 +290,12 @@ def main():
         "sisdr": "SI-SDR",
         "lsd": "LSD",
         "estoi": "ESTOI",
+        "magnitude": "Magnitude",
+        "phase": "Phase",
+        "phase_ip": "Phase-IP",
+        "phase_gd": "Phase-GD",
+        "phase_iaf": "Phase-IAF",
+        "complex": "Complex",
     }
     for m in metric_names:
         print(
