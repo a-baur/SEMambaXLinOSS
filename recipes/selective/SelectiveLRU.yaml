@@ -11,6 +11,8 @@ env_setting:
   validation_interval: 1000
   summary_interval: 100
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
+  max_valid_samples: 64  # cap the validation set (read from env_setting, see train.py)
+  single_gpu_validation: false  # if true, only rank 0 validates (full set); others wait at a barrier
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
     dist_url: tcp://localhost:19478  # URL for initializing distributed training.
@@ -33,7 +35,6 @@ training_cfg:
   batch_size: 12  # Training batch size.
   val_batch_size: 12
   valid_crop_seconds: 6.0
-  max_valid_samples: 64
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
   adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.

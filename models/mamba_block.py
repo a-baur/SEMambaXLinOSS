@@ -3,38 +3,114 @@
 import math
 from functools import partial
 
-import torch
-import torch.nn as nn
 from mamba_ssm.models.mixer_seq_simple import _init_weights
 from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba3 import Mamba3
-from mamba_ssm.ops.triton.layer_norm import RMSNorm
 
 from models.linoss import LinOSS
 from models.selective_lru import SelectiveLRU, SelectiveLRUMIMO
 from models.s4d.s4d import S4DCore
 from models.s5.s5 import S5
 from models.mixer import MambaStyleMixer
+from typing import Literal
+
+import torch
+from torch import nn
+
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 
-# github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
-def create_block(
-    d_model,
-    model_cfg,
-    layer_idx=0,
-    rms_norm=True,
-    fused_add_norm=False,
-    residual_in_fp32=False,
+def _apply_layer_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    norm_layer: nn.Module,
 ):
+    return layer_norm_fn(
+        x,
+        norm_layer.weight,
+        norm_layer.bias,
+        residual=residual,
+        prenorm=True,
+        eps=norm_layer.eps,
+        is_rms_norm=isinstance(norm_layer, RMSNorm),
+    )
+
+
+class HybridBlock(nn.Module):
+    """Hybrid backbone block, allowing sequential processing or parallel processing + gating."""
+
+    def __init__(
+        self,
+        dim: int,
+        backbone_1: nn.Module,
+        backbone_2: nn.Module,
+        mode: Literal["sequential", "parallel"] = "sequential",
+        gate_hidden: int | None = None,
+        norm_cls=None,
+    ):
+
+        super().__init__()
+        self.backbone_1 = backbone_1
+        self.backbone_2 = backbone_2
+        self.mode = mode
+
+        # Match the surrounding stack's norm (RMSNorm when rms_norm=True); default
+        # to LayerNorm when built standalone. _apply_layer_norm handles both.
+        norm_cls = norm_cls if norm_cls is not None else partial(nn.LayerNorm, eps=1e-5)
+        self.norm1 = norm_cls(dim)
+        self.norm2 = norm_cls(dim) if mode == "sequential" else None
+
+        if mode == "parallel":
+            if gate_hidden is None:
+                self.gate = nn.Linear(2 * dim, dim)
+            else:
+                self.gate = nn.Sequential(
+                    nn.Linear(2 * dim, gate_hidden),
+                    nn.SiLU(),
+                    nn.Linear(gate_hidden, dim),
+                )
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mamba ``Block``-style prenorm contract: returns ``(hidden, residual)``.
+
+        The residual stream is threaded (and its final add deferred) exactly like
+        ``mamba_ssm.modules.block.Block`` so this drops into ``MambaBlock``'s loop,
+        which does the closing ``hidden + residual`` add.
+        """
+        if self.mode == "sequential":
+            x, residual = _apply_layer_norm(x, residual, self.norm1)
+            x = self.backbone_1(x)
+            x, residual = _apply_layer_norm(x, residual, self.norm2)
+            x = self.backbone_2(x)
+        elif self.mode == "parallel":
+            x, residual = _apply_layer_norm(x, residual, self.norm1)
+            x1 = self.backbone_1(x)
+            x2 = self.backbone_2(x)
+            g = torch.sigmoid(self.gate(torch.cat([x1, x2], dim=-1)))
+            x = g * x1 + (1.0 - g) * x2
+        return x, residual
+
+
+def _build_mixer_cls(d_model, model_cfg, layer_idx=0):
+    """Build the mixer_cls partial for a single backbone.
+
+    The returned partial is callable as ``mixer_cls(d_model)`` (the contract
+    ``mamba_ssm``'s ``Block`` expects), so it can be handed to ``Block`` for a
+    plain block or instantiated directly for a ``HybridBlock`` backbone. All
+    per-mixer hyperparameters (``ssm``, ``d_state``, ``d_conv``, ``expand``,
+    ``ssm_params``) are read from ``model_cfg``, which for a hybrid backbone is
+    that backbone's own sub-config.
+    """
     ssm = model_cfg["ssm"]
     ssm_params = model_cfg.get("ssm_params", {})
 
     d_state = model_cfg["d_state"]  # 16
     d_conv = model_cfg["d_conv"]  # 4
     expand = model_cfg["expand"]  # 4
-    norm_epsilon = model_cfg["norm_epsilon"]  # 0.00001
 
     if ssm == "mamba":
         mixer_cls = partial(
@@ -198,10 +274,43 @@ def create_block(
     else:
         raise ValueError(
             f"Unknown mixer {ssm!r}; expected 'mamba', 'mamba2', 'mamba3', "
-            "'linoss', 'selective_linoss', 'mamboss6', 's4d', or 's5'."
+            "'linoss', 'selective_lru', 'selective_lru_mimo', 's4d', or 's5'."
         )
 
+    return mixer_cls
+
+
+# github: https://github.com/state-spaces/mamba/blob/9127d1f47f367f5c9cc49c73ad73557089d02cb8/mamba_ssm/models/mixer_seq_simple.py
+def create_block(
+    d_model,
+    model_cfg,
+    layer_idx=0,
+    rms_norm=True,
+    fused_add_norm=False,
+    residual_in_fp32=False,
+):
+    norm_epsilon = model_cfg.get("norm_epsilon", 1e-5)  # 0.00001
     norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon)
+
+    # Hybrid: two backbones defined by their own sub-configs
+    if model_cfg["ssm"] == "hybrid":
+        hybrid_cfg = model_cfg.get("hybrid", {})
+        cfg_1 = model_cfg["backbone_1"]
+        cfg_2 = model_cfg["backbone_2"]
+        backbone_1 = _build_mixer_cls(d_model, cfg_1, layer_idx)(d_model)
+        backbone_2 = _build_mixer_cls(d_model, cfg_2, layer_idx)(d_model)
+        block = HybridBlock(
+            dim=d_model,
+            backbone_1=backbone_1,
+            backbone_2=backbone_2,
+            mode=hybrid_cfg.get("mode", "sequential"),
+            gate_hidden=hybrid_cfg.get("gate_hidden", None),
+            norm_cls=norm_cls,
+        )
+        block.layer_idx = layer_idx
+        return block
+
+    mixer_cls = _build_mixer_cls(d_model, model_cfg, layer_idx)
     # New mamba_ssm Block requires mlp_cls as a positional arg; nn.Identity keeps
     # these blocks mixer-only (no MLP), matching the previous behavior.
     block = Block(

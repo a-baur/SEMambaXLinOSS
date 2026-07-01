@@ -47,7 +47,18 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, stft_params, best):
+def validate(
+    generator,
+    evaluator,
+    validation_loader,
+    cfg,
+    device,
+    sw,
+    steps,
+    stft_params,
+    best,
+    distributed_reduce=True,
+):
     """Run the (sharded) validation pass, log averaged metrics, and return updated bests.
 
     Called on every rank: each rank scores its disjoint shard of the validation set
@@ -56,6 +67,10 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
     derives the same averages. Spreading the work across ranks keeps them all busy
     instead of leaving ranks>0 idling at the next training collective while rank 0
     validates -- that idle wait is what tripped the NCCL watchdog.
+
+    ``distributed_reduce`` gates that all-reduce. Set it False for single-GPU
+    validation (``single_gpu_validation``), where only rank 0 runs this over the
+    full, un-sharded set and there is no per-rank total to combine.
 
     Only the original metric set (magnitude / phase / complex losses + PESQ / MR-STFT
     / UTMOS) is computed; the heavier neural / CPU metrics (DistillMOS, SI-SDR, LSD,
@@ -158,7 +173,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
 
     keys = list(val_metrics)
     totals = torch.tensor([val_metrics[k] for k in keys] + [float(n_utts)], device=device)
-    if dist.is_initialized() and dist.get_world_size() > 1:
+    if distributed_reduce and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
     n_total = max(totals[-1].item(), 1.0)
     averaged = {k: (totals[i] / n_total).item() for i, k in enumerate(keys)}
@@ -414,10 +429,20 @@ def train(rank, args, cfg):
 
     # Create the validation set on every rank and shard it across ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    single_gpu_val = cfg["env_setting"].get("single_gpu_validation", False)
     validset = create_dataset(cfg, train=False, split=False, device=device)
-    validation_loader = create_dataloader(
-        validset, cfg, train=False, rank=rank, world_size=world_size
-    )
+    if single_gpu_val and world_size > 1:
+        # Validation runs on rank 0 only, over the full (un-sharded) set; the
+        # other ranks skip it and wait at a barrier. Their loader is unused.
+        validation_loader = (
+            create_dataloader(validset, cfg, train=False, rank=0, world_size=1)
+            if rank == 0
+            else None
+        )
+    else:
+        validation_loader = create_dataloader(
+            validset, cfg, train=False, rank=rank, world_size=world_size
+        )
     # Only rank 0 owns the TensorBoard / wandb writer.
     sw = None
     if rank == 0:
@@ -577,18 +602,37 @@ def train(rank, args, cfg):
             # are all-reduced), so it sits outside the rank-0 block -- all ranks must
             # hit the same collectives in lockstep. steps advances identically on
             # every rank (DistributedSampler + drop_last), so this fires in sync.
+            # With single_gpu_validation, only rank 0 validates (over the full set)
+            # and the other ranks wait at a barrier so all ranks re-enter the
+            # training collectives together.
             if steps % cfg["env_setting"]["validation_interval"] == 0 and steps != 0:
-                best_pesq, best_pesq_step, best_utmos, best_utmos_step = validate(
-                    generator,
-                    evaluator,
-                    validation_loader,
-                    cfg,
-                    device,
-                    sw,
-                    steps,
-                    (n_fft, hop_size, win_size, compress_factor),
-                    (best_pesq, best_pesq_step, best_utmos, best_utmos_step),
-                )
+                if single_gpu_val and world_size > 1:
+                    if rank == 0:
+                        best_pesq, best_pesq_step, best_utmos, best_utmos_step = validate(
+                            generator,
+                            evaluator,
+                            validation_loader,
+                            cfg,
+                            device,
+                            sw,
+                            steps,
+                            (n_fft, hop_size, win_size, compress_factor),
+                            (best_pesq, best_pesq_step, best_utmos, best_utmos_step),
+                            distributed_reduce=False,
+                        )
+                    dist.barrier()
+                else:
+                    best_pesq, best_pesq_step, best_utmos, best_utmos_step = validate(
+                        generator,
+                        evaluator,
+                        validation_loader,
+                        cfg,
+                        device,
+                        sw,
+                        steps,
+                        (n_fft, hop_size, win_size, compress_factor),
+                        (best_pesq, best_pesq_step, best_utmos, best_utmos_step),
+                    )
 
             steps += 1
 
