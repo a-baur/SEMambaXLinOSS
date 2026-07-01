@@ -51,10 +51,11 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
     """Run the validation pass on rank 0, log averaged metrics, and return updated bests.
 
     Called on rank 0 only: it scores the full validation set one full-length utterance
-    at a time and averages the metrics. Only the original metric set (magnitude / phase
-    / complex losses + PESQ / MR-STFT / UTMOS) is computed; the heavier neural / CPU
-    metrics (DistillMOS, SI-SDR, LSD, NISQA, eSTOI) are left to ``evaluate.py``. ``best``
-    is the running ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated.
+    at a time and averages the metrics. The fast metric set (magnitude / phase / complex
+    losses -- phase is also broken out into its IP / GD / IAF components -- + PESQ /
+    MR-STFT / UTMOS / SI-SDR / LSD) is computed; the heavier neural / CPU metrics
+    (DistillMOS, NISQA, eSTOI) are left to ``evaluate.py``. ``best`` is the running
+    ``(pesq, pesq_step, utmos, utmos_step)`` tuple, returned updated.
     """
     n_fft, hop_size, win_size, compress_factor = stft_params
     sr = cfg["stft_cfg"]["sampling_rate"]
@@ -71,10 +72,15 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
         (
             "Magnitude Loss",
             "Phase Loss",
+            "Phase-IP Loss",
+            "Phase-GD Loss",
+            "Phase-IAF Loss",
             "Complex Loss",
             "PESQ Score",
             "MultiResSTFT Loss",
             "UTMOS Score",
+            "SI-SDR Score",
+            "LSD",
         ),
         0.0,
     )
@@ -100,7 +106,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
             min_len = min(clean_audio.size(-1), audio_g.size(-1))
 
             # Batched PESQ (CPU pool across the batch) and UTMOS (GPU) run concurrently.
-            pesq, mrstft, utmos = evaluator.compute_val(
+            pesq, mrstft, utmos, sisdr, lsd = evaluator.compute_val(
                 clean_audio[..., :min_len], audio_g[..., :min_len]
             )
 
@@ -128,11 +134,16 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
 
             ip, gd, iaf = phase_losses(clean_pha, pha_g, cfg)
             val_metrics["Phase Loss"] += (ip + gd + iaf).item() * b
+            val_metrics["Phase-IP Loss"] += ip.item() * b
+            val_metrics["Phase-GD Loss"] += gd.item() * b
+            val_metrics["Phase-IAF Loss"] += iaf.item() * b
             val_metrics["Magnitude Loss"] += F.mse_loss(clean_mag, mag_g).item() * b
             val_metrics["Complex Loss"] += F.mse_loss(clean_com, com_g).item() * b
             val_metrics["PESQ Score"] += pesq * b
             val_metrics["MultiResSTFT Loss"] += mrstft * b
             val_metrics["UTMOS Score"] += utmos * b
+            val_metrics["SI-SDR Score"] += sisdr * b
+            val_metrics["LSD"] += lsd * b
             n_utts += b
 
             # Live running means on the progress bar.

@@ -70,17 +70,20 @@ class Evaluator:
     def compute_val(self, clean, pred):
         """Fast batched metrics for the in-training validation loop.
 
-        Computes PESQ, MR-STFT and UTMOS for a whole (fixed-length, uniform) batch
-        and returns their batch means as Python floats. PESQ runs on a CPU process
-        pool launched on a background thread, so it overlaps with UTMOS/MR-STFT on
-        the GPU instead of running after them. Returns ``(pesq, mrstft, utmos)``.
+        Computes PESQ, MR-STFT, UTMOS, SI-SDR and LSD for a whole (fixed-length,
+        uniform) batch and returns their batch means as Python floats. PESQ runs on
+        a CPU process pool launched on a background thread, so it overlaps with the
+        GPU metrics instead of running after them. Returns
+        ``(pesq, mrstft, utmos, sisdr, lsd)``.
         """
         # Launch PESQ (CPU) first so its pool spins up while the GPU metrics run.
         pesq_future = self._pesq_executor.submit(self._pesq_safe, pred, clean)
         mrstft = self._mrstft(pred.unsqueeze(1), clean.unsqueeze(1)).item()
         utmos = self._utmos(pred, self._sr).mean().item()
+        sisdr = self._sisdr(pred, clean).item()
+        lsd = self._lsd(clean, pred).item()
         pesq = pesq_future.result()
-        return pesq, mrstft, utmos
+        return pesq, mrstft, utmos, sisdr, lsd
 
     def _lsd(self, clean, pred):
         """Mean log-spectral distance (dB-free, log10 power) as a 0-dim tensor.
