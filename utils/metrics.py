@@ -40,7 +40,7 @@ class Evaluator:
         )
         if os.path.exists(HPC_ALEX_SPEECHMOS_PATH):
             self._utmos = torch.hub.load(
-                repo_or_dir="",
+                repo_or_dir=HPC_ALEX_SPEECHMOS_PATH,
                 model="utmos22_strong",
                 source="local",
             ).eval()
