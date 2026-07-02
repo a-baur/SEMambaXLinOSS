@@ -597,6 +597,15 @@ def train(rank, args, cfg):
 
 
 # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
+def _pick_free_port():
+    """Ask the OS for a currently-unused TCP port on localhost."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_folder", default="exp")
@@ -604,9 +613,28 @@ def main():
     parser.add_argument(
         "--config", default="/data5/baur/SEMambaXLinOSS/recipes/selective/MambOSS.yaml"
     )
+    parser.add_argument(
+        "--dist_port",
+        type=int,
+        default=None,
+        help="Rendezvous port for distributed training. Overrides the config's "
+        "dist_url port. If omitted, a free port is auto-picked so concurrent runs "
+        "never collide.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # Avoid NCCL rendezvous collisions when several configs train at once: the
+    # port baked into a recipe is shared across recipes, so override it with an
+    # explicit --dist_port or an auto-picked free port unless a non-localhost
+    # URL was configured on purpose.
+    dist_url = cfg["env_setting"]["dist_cfg"]["dist_url"]
+    if dist_url.startswith("tcp://localhost:") or dist_url.startswith("tcp://127.0.0.1:"):
+        host = dist_url.split("//", 1)[1].rsplit(":", 1)[0]
+        port = args.dist_port if args.dist_port is not None else _pick_free_port()
+        cfg["env_setting"]["dist_cfg"]["dist_url"] = f"tcp://{host}:{port}"
+        print(f"Distributed rendezvous: {cfg['env_setting']['dist_cfg']['dist_url']}")
     seed = cfg["env_setting"]["seed"]
     num_gpus = cfg["env_setting"]["num_gpus"]
     available_gpus = torch.cuda.device_count()
