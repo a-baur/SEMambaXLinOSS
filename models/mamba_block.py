@@ -39,7 +39,14 @@ def _apply_layer_norm(
 
 
 class HybridBlock(nn.Module):
-    """Hybrid backbone block, allowing sequential processing or parallel processing + gating."""
+    """Hybrid backbone block.
+
+    Apply two backbones in a single time-frequency block.
+    - Mode 'sequential' applies them sequentially with skip connections,
+        like MambAttention (attention -> mamba).
+    - Mode 'parallel' applies them in parallel and combines outputs
+        via gated fusion.
+    """
 
     def __init__(
         self,
@@ -56,8 +63,6 @@ class HybridBlock(nn.Module):
         self.backbone_2 = backbone_2
         self.mode = mode
 
-        # Match the surrounding stack's norm (RMSNorm when rms_norm=True); default
-        # to LayerNorm when built standalone. _apply_layer_norm handles both.
         norm_cls = norm_cls if norm_cls is not None else partial(nn.LayerNorm, eps=1e-5)
         self.norm1 = norm_cls(dim)
         self.norm2 = norm_cls(dim) if mode == "sequential" else None
@@ -92,6 +97,8 @@ class HybridBlock(nn.Module):
             x2 = self.backbone_2(x)
             g = torch.sigmoid(self.gate(torch.cat([x1, x2], dim=-1)))
             x = g * x1 + (1.0 - g) * x2
+        else:
+            raise ValueError(f"Unknown mode {self.mode}. Has to be either 'sequential' or 'parallel'.")
         return x, residual
 
 
