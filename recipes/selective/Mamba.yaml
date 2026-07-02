@@ -14,7 +14,6 @@ env_setting:
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:19477  # URL for initializing distributed training.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -33,7 +32,6 @@ training_cfg:
   training_epochs: 200 # Training epoch.
   val_batch_size: 24
   valid_crop_seconds: 6.0
-  max_valid_samples: 64
   batch_size: 8  # Training batch size.
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.

@@ -2,7 +2,7 @@
 # These settings specify the hardware and distributed setup for the model training.
 # Adjust `num_gpus` and `dist_config` according to your distributed training environment.
 env_setting:
-  num_gpus: 3  # Number of GPUs. Now we don't support CPU mode.
+  num_gpus: 2  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 16  # Number of worker threads for data loading.
   val_num_workers: 4  # Worker threads for the (rank-0-only) validation loader.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
@@ -11,9 +11,9 @@ env_setting:
   validation_interval: 1000
   summary_interval: 100
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
+  max_valid_samples: 120  # cap the validation set (read from env_setting, see train.py)
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:19477  # URL for initializing distributed training.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -30,8 +30,9 @@ data_cfg:
 # including batch sizes, learning rates, and optimizer specifics.
 training_cfg:
   training_epochs: 200 # Training epoch.
-  batch_size: 12  # Training batch size.
-  val_batch_size: 8  # Validation batch size (utterances are padded then cropped back). Raise to keep high-latency GPUs (e.g. A40) busy; 1 reproduces the old per-utterance behaviour.
+  batch_size: 8  # Training batch size.
+  val_batch_size: 24  # Validation batch size (utterances are padded then cropped back). Raise to keep high-latency GPUs (e.g. A40) busy; 1 reproduces the old per-utterance behaviour.
+  valid_crop_seconds: 6.0
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
   adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.

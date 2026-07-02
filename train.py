@@ -625,16 +625,19 @@ def main():
 
     cfg = load_config(args.config)
 
-    # Avoid NCCL rendezvous collisions when several configs train at once: the
-    # port baked into a recipe is shared across recipes, so override it with an
-    # explicit --dist_port or an auto-picked free port unless a non-localhost
-    # URL was configured on purpose.
-    dist_url = cfg["env_setting"]["dist_cfg"]["dist_url"]
-    if dist_url.startswith("tcp://localhost:") or dist_url.startswith("tcp://127.0.0.1:"):
-        host = dist_url.split("//", 1)[1].rsplit(":", 1)[0]
+    # Avoid NCCL rendezvous collisions when several configs train at once. The
+    # recipes no longer pin a port, so build a localhost URL with an explicit
+    # --dist_port or an auto-picked free port. A non-localhost dist_url in the
+    # config (real multi-node) is left untouched.
+    dist_cfg = cfg["env_setting"]["dist_cfg"]
+    dist_url = dist_cfg.get("dist_url")
+    if not dist_url or dist_url.startswith("tcp://localhost") or dist_url.startswith(
+        "tcp://127.0.0.1"
+    ):
+        host = dist_url.split("//", 1)[1].rsplit(":", 1)[0] if dist_url else "localhost"
         port = args.dist_port if args.dist_port is not None else _pick_free_port()
-        cfg["env_setting"]["dist_cfg"]["dist_url"] = f"tcp://{host}:{port}"
-        print(f"Distributed rendezvous: {cfg['env_setting']['dist_cfg']['dist_url']}")
+        dist_cfg["dist_url"] = f"tcp://{host}:{port}"
+        print(f"Distributed rendezvous: {dist_cfg['dist_url']}")
     seed = cfg["env_setting"]["seed"]
     num_gpus = cfg["env_setting"]["num_gpus"]
     available_gpus = torch.cuda.device_count()

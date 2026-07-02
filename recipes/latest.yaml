@@ -2,11 +2,10 @@
 # These settings specify the hardware and distributed setup for the model training.
 # Adjust `num_gpus` and `dist_config` according to your distributed training environment.
 env_setting:
-  num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
+  num_gpus: 2  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 16  # Number of worker threads for data loading.
   val_num_workers: 4  # Worker threads for the validation loader (parallel/prefetched file I/O on HPC storage).
-  val_prefetch_factor: 2  # Batches each val worker prefetches ahead of the GPU.
-  max_valid_samples: 200  # Cap utterances scored per validation pass (first N, sharded across ranks). null/0 = whole set.
+  max_valid_samples: 120  # Cap utterances scored per validation pass (first N, sharded across ranks). null/0 = whole set.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
   stdout_interval: 10
   checkpoint_interval: 1000  # save model to ckpt every N steps
@@ -15,7 +14,6 @@ env_setting:
   num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    dist_url: tcp://localhost:19478  # URL for initializing distributed training.
     world_size: 1  # Total number of processes in the distributed training.
 
 # Datapath Configuratoin
@@ -32,8 +30,8 @@ data_cfg:
 # including batch sizes, learning rates, and optimizer specifics.
 training_cfg:
   training_epochs: 200 # Training epoch.
-  batch_size: 12  # Training batch size.
-  val_batch_size: 12  # Validation batch size. Utterances are cropped to a fixed valid_crop_seconds window so the batch is uniform; raise to keep high-latency GPUs (e.g. A40) busy and to widen the PESQ process pool.
+  batch_size: 8  # Training batch size.
+  val_batch_size: 24  # Validation batch size. Utterances are cropped to a fixed valid_crop_seconds window so the batch is uniform; raise to keep high-latency GPUs (e.g. A40) busy and to widen the PESQ process pool.
   valid_crop_seconds: 6.0  # Fixed-length window each val utterance is cropped to (uniform batch + fast metrics).
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
