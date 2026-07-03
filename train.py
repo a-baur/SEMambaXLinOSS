@@ -4,6 +4,7 @@ from utils.viz import log_audio_and_spectrograms
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 import argparse
+import glob
 import os
 import time
 
@@ -349,6 +350,21 @@ def create_dataloader(dataset, cfg, train=True):
     )
 
 
+def find_wandb_run_id(exp_path):
+    """Return the id of the most recent wandb run stored under ``exp_path``.
+
+    wandb writes each run to ``<exp_path>/wandb/run-<timestamp>-<id>``; the run id
+    is the final ``-``-delimited segment (timestamps use ``_``, never ``-``).
+    Returns ``None`` when no prior run exists so training starts a fresh one.
+    """
+    wandb_dir = os.path.join(exp_path, "wandb")
+    run_dirs = glob.glob(os.path.join(wandb_dir, "run-*-*"))
+    if not run_dirs:
+        return None
+    latest = sorted(os.path.basename(d) for d in run_dirs)[-1]
+    return latest.rsplit("-", 1)[-1]
+
+
 def train(rank, args, cfg):
     num_gpus = cfg["env_setting"]["num_gpus"]
     n_fft, hop_size, win_size = (
@@ -410,12 +426,19 @@ def train(rank, args, cfg):
     if rank == 0:
         validset = create_dataset(cfg, train=False, split=False, device=device)
         validation_loader = create_dataloader(validset, cfg, train=False)
+        # Resume the same wandb run when continuing from a checkpoint and a prior
+        # run exists for this experiment; otherwise start a fresh run.
+        resume_id = find_wandb_run_id(args.exp_path) if state_dict_g is not None else None
+        if resume_id is not None:
+            print(f"Resuming wandb run '{resume_id}' at step {steps}.")
         wandb.init(
             project="SEMambaBackbones",
             name=args.exp_name,
             dir=args.exp_path,
             config=cfg,
             sync_tensorboard=True,
+            id=resume_id,
+            resume="allow",
         )
         sw = SummaryWriter(os.path.join(args.exp_path, "logs"))
 
