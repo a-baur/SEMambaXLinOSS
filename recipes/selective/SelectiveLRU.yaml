@@ -1,85 +1,21 @@
-# Environment Settings
-# These settings specify the hardware and distributed setup for the model training.
-# Adjust `num_gpus` and `dist_config` according to your distributed training environment.
-env_setting:
-  num_gpus: 2  # Number of GPUs. Now we don't support CPU mode.
-  num_workers: 16  # Number of worker threads for data loading.
-  val_num_workers: 4  # Worker threads for the (rank-0-only) validation loader.
-  seed: 1234  # Seed for random number generators to ensure reproducibility.
-  stdout_interval: 10
-  checkpoint_interval: 1000  # save model to ckpt every N steps
-  validation_interval: 1000
-  summary_interval: 100
-  max_valid_samples: 120
-  num_viz_samples: 5  # validation examples logged as waveforms/spectrograms to TensorBoard
-  dist_cfg:
-    dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
-    world_size: 1  # Total number of processes in the distributed training.
+# SelectiveLRU -- inherits shared config from base.yaml; only the mixer block differs.
+base: ../base.yaml
 
-# Datapath Configuratoin
-data_cfg:
-  train_clean_json: data/ears_wham_16k/train_clean.json
-  train_noisy_json: data/ears_wham_16k/train_noisy.json
-  valid_clean_json: data/ears_wham_16k/valid_clean.json
-  valid_noisy_json: data/ears_wham_16k/valid_noisy.json
-  test_clean_json: data/ears_wham_16k/test_clean.json
-  test_noisy_json: data/ears_wham_16k/test_noisy.json
-
-# Training Configuration
-# This section details parameters that directly influence the training process,
-# including batch sizes, learning rates, and optimizer specifics.
-training_cfg:
-  training_epochs: 200 # Training epoch.
-  batch_size: 8  # Training batch size.
-  val_batch_size: 24
-  valid_crop_seconds: 6.0
-  learning_rate: 0.0005  # Initial learning rate.
-  adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
-  adam_b2: 0.99  # Beta2 hyperparameter for the AdamW optimizer.
-  lr_decay: 0.99  # Learning rate decay per epoch.
-  segment_size: 32000  # Audio segment size used during training, dependent on sampling rate.
-  loss:
-    metric: 0.05
-    magnitude: 0.9
-    phase: 0.3
-    complex: 0.1
-    time: 0.2
-    consistancy: 0.1
-  use_PCS400: False  # Use PCS or not
-
-# STFT Configuration
-# Configuration for Short-Time Fourier Transform (STFT), crucial for audio processing models.
-stft_cfg:
-  sampling_rate: 16000  # Audio sampling rate in Hz.
-  n_fft: 400  # FFT components for transforming audio signals.
-  hop_size: 100  # Samples between successive frames.
-  win_size: 400  # Window size used in FFT.
-
-# Model Configuration
-# Defines the architecture specifics of the model, including layer configurations and feature compression.
 model_cfg:
   use_phase_fan: false
   use_fan_denseblock: false
-  hid_feature: 64  # Channels in dense layers.
-  compress_factor: 0.3  # Compression factor applied to extracted features.
-  num_tfmamba: 4  # Number of Time-Frequency blocks in the model.
-  beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.
-  input_channel: 2 # Magnitude and Phase
-  output_channel: 1  # Single Channel Speech Enhancement
-
-  d_state: 8  # Oscillator modes PER CHANNEL (state_dim).
-  d_conv: 4  # Convolutional layer dimensionality within the Mamba-style surround.
-  expand: 4  # Expansion factor; the SSM runs on expand*hid_feature channels.
-  norm_epsilon: 0.00001  # Numerical stability in normalization layers.
-  causal_conv: true      # causal depthwise conv before the SSM
-
+  d_state: 8
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 1.0e-05
+  causal_conv: true
   ssm: selective_lru
   ssm_params:
-    dt_rank:               # low-rank bottleneck for the nu/theta time-steps; null -> ceil(in_features/64)
-    dt_min: 0.001          # baseline damping time-step band lower bound (Mamba-style)
-    dt_max: 0.1            # baseline damping time-step band upper bound
-    theta_max: 3.141592653589793  # baseline per-mode frequency spread upper bound (pi)
-    init_std: 0.01         # std of the small selective low-rank projection weights at init
-    use_triton: true       # fused kernel: per-channel state stays off HBM (fwd in regs, bwd recomputes)
-    chunk_size: 16         # backward recompute chunk width (peak extra HBM scales with it)
-    block_c: 32            # per-program channel-slab width (throughput knob; >64 spills registers)
+    dt_rank: null
+    dt_min: 0.001
+    dt_max: 0.1
+    theta_max: 3.141592653589793
+    init_std: 0.01
+    use_triton: true
+    chunk_size: 16
+    block_c: 32

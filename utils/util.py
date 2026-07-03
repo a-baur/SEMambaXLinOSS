@@ -1,7 +1,6 @@
 import yaml
 import torch
 import os
-import shutil
 import glob
 from datetime import timedelta
 from torch.distributed import init_process_group
@@ -36,10 +35,31 @@ def print_gpu_info(cfg):
         print(f"Starting training on\n{devices}\n")
         print("Batch size per GPU:", int(cfg["training_cfg"]["batch_size"] / n_gpus))
 
+def _deep_merge(base, override):
+    """Recursively merge ``override`` into ``base`` (override wins); returns base."""
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def load_config(config_path):
-    """Load configuration from a YAML file."""
+    """Load a YAML config, resolving an optional ``base:`` parent by deep-merge.
+
+    A recipe may set ``base: <relative/path.yaml>`` (resolved relative to the
+    recipe) to inherit a shared config; the recipe's own keys override the base,
+    dicts merged recursively. Nesting is supported (a base may declare its own
+    base). Configs without a ``base:`` key load exactly as before.
+    """
     with open(config_path, 'r') as file:
-        return yaml.safe_load(file)
+        cfg = yaml.safe_load(file)
+    base_ref = cfg.pop("base", None)
+    if base_ref is not None:
+        base_path = os.path.join(os.path.dirname(config_path), base_ref)
+        return _deep_merge(load_config(base_path), cfg)
+    return cfg
 
 def initialize_seed(seed):
     """Initialize the random seed for both CPU and GPU."""
@@ -108,10 +128,17 @@ def scan_checkpoint(cp_dir, prefix):
     return sorted(cp_list)[-1]
 
 def build_env(config, config_name, exp_path):
+    """Persist the fully-resolved config next to the run.
+
+    Dumps the merged (base + overrides) config rather than copying the source
+    file, so each run's ``config.yaml`` is a self-contained snapshot that
+    ``evaluate.py`` can read back without the repo's shared ``base.yaml``.
+    """
     os.makedirs(exp_path, exist_ok=True)
     t_path = os.path.join(exp_path, config_name)
-    if config != t_path:
-        shutil.copyfile(config, t_path)
+    resolved = load_config(config)
+    with open(t_path, 'w') as file:
+        yaml.safe_dump(resolved, file, sort_keys=False)
 
 def load_optimizer_states(optimizers, state_dict_do):
     """Load optimizer states from checkpoint."""
