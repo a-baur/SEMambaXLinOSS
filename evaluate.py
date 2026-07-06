@@ -1,16 +1,23 @@
 """Evaluate a SEMamba generator checkpoint on a test set.
 
-Supports two checkpoint layouts:
+Supports three checkpoint layouts:
   * single-file ckpts (e.g. ``ckpts/SEMamba_advanced.pth``)
-  * exp-run directories produced by ``train.py`` (e.g. ``exp/LinOSS``),
-    where the latest ``g_????????.pth`` is picked automatically and the
-    co-located ``config.yaml`` is used by default.
+  * checkpoint directories holding a single named ``*.pth`` + ``config.yaml``
+    (e.g. ``ckpts/mamba/``) or exp-run directories produced by ``train.py``
+    (e.g. ``exp/LinOSS``), where the latest ``g_????????.pth`` is picked
+    automatically and the co-located ``config.yaml`` is used by default.
+  * a *parent* directory of such checkpoint directories (e.g. ``ckpts/``):
+    every checkpoint under it is evaluated and compared. Each run's outputs
+    land in ``<output_dir>/<name>/`` and a combined ``comparison.json`` plus a
+    printed table rank the checkpoints side by side.
 
 Outputs:
   * ``<output_dir>/metrics.json`` -- per-utterance PESQ / MR-STFT / UTMOS
-    plus a summary block with the mean of each.
+    plus a summary block with the mean and variance of each.
   * ``<output_dir>/samples/<utt>_{noisy,enhanced,clean}.wav`` -- a fixed,
     deterministic subset of enhanced clips with their noisy / clean refs.
+  * ``<output_dir>/comparison.json`` (compare mode only) -- the per-checkpoint
+    summary blocks gathered into one file.
 """
 
 import argparse
@@ -47,7 +54,10 @@ def resolve_checkpoint_and_config(ckpt_arg: str, config_arg: str | None):
     if os.path.isdir(ckpt_arg):
         candidates = sorted(glob.glob(os.path.join(ckpt_arg, "g_????????.pth")))
         if not candidates:
-            raise FileNotFoundError(f"No g_*.pth checkpoints under {ckpt_arg}")
+            # Named single-file ckpts (e.g. ckpts/mamba/mamba.pth).
+            candidates = sorted(glob.glob(os.path.join(ckpt_arg, "*.pth")))
+        if not candidates:
+            raise FileNotFoundError(f"No *.pth checkpoints under {ckpt_arg}")
         ckpt_file = candidates[-1]
         default_config = os.path.join(ckpt_arg, "config.yaml")
     else:
@@ -62,6 +72,56 @@ def resolve_checkpoint_and_config(ckpt_arg: str, config_arg: str | None):
             f"Config not found at {config_file}; pass --config explicitly."
         )
     return ckpt_file, config_file
+
+
+def is_checkpoint_dir(path: str) -> bool:
+    """True if ``path`` directly holds a ``.pth`` (a single checkpoint)."""
+    return os.path.isdir(path) and bool(glob.glob(os.path.join(path, "*.pth")))
+
+
+def find_checkpoint_dirs(root: str) -> list[str]:
+    """Return sorted immediate subdirectories of ``root`` that are checkpoints."""
+    subdirs = sorted(
+        p for p in glob.glob(os.path.join(root, "*")) if is_checkpoint_dir(p)
+    )
+    return subdirs
+
+
+METRIC_NAMES = (
+    "pesq",
+    "mrstft",
+    "utmos",
+    "distillmos",
+    "dnsmospro",
+    "nisqa",
+    "sisdr",
+    "lsd",
+    "estoi",
+    "magnitude",
+    "phase",
+    "phase_ip",
+    "phase_gd",
+    "phase_iaf",
+    "complex",
+)
+
+METRIC_LABELS = {
+    "pesq": "PESQ",
+    "mrstft": "MR-STFT",
+    "utmos": "UTMOS",
+    "distillmos": "DistillMOS",
+    "dnsmospro": "DNSMOSPro",
+    "nisqa": "NISQA",
+    "sisdr": "SI-SDR",
+    "lsd": "LSD",
+    "estoi": "ESTOI",
+    "magnitude": "Magnitude",
+    "phase": "Phase",
+    "phase_ip": "Phase-IP",
+    "phase_gd": "Phase-GD",
+    "phase_iaf": "Phase-IAF",
+    "complex": "Complex",
+}
 
 
 def load_generator(ckpt_file: str, cfg: dict, device: torch.device) -> SEMamba:
@@ -122,32 +182,20 @@ def build_pair_list(cfg: dict, test_clean_json: str | None, test_noisy_json: str
     return pairs
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--checkpoint",
-        default="ckpts/SEMamba_advanced.pth",
-        help="Path to a .pth file or an exp directory containing g_*.pth.",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="YAML config. Defaults to config.yaml next to the checkpoint.",
-    )
-    parser.add_argument("--test_clean_json", default=None)
-    parser.add_argument("--test_noisy_json", default=None)
-    parser.add_argument("--output_dir", default="eval_out")
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=10,
-        help="Number of fixed enhanced clips to save (alongside noisy/clean refs).",
-    )
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+def evaluate_checkpoint(
+    ckpt_file: str,
+    config_file: str,
+    output_dir: str,
+    args,
+    device: torch.device,
+    evaluator_cache: dict,
+) -> dict:
+    """Evaluate one checkpoint, write ``<output_dir>/metrics.json`` + samples.
 
-    device = torch.device(args.device)
-    ckpt_file, config_file = resolve_checkpoint_and_config(args.checkpoint, args.config)
+    Returns the summary block (means/variances/counts). ``evaluator_cache``
+    memoizes one ``Evaluator`` per sampling rate so compare mode does not
+    rebuild the (expensive) metric models per checkpoint.
+    """
     print(f"Checkpoint : {ckpt_file}")
     print(f"Config     : {config_file}")
 
@@ -155,32 +203,20 @@ def main():
     sr = cfg["stft_cfg"]["sampling_rate"]
 
     model = load_generator(ckpt_file, cfg, device)
-    evaluator = Evaluator(sr=sr).to(device)
+    if sr not in evaluator_cache:
+        evaluator_cache[sr] = Evaluator(sr=sr).to(device)
+    evaluator = evaluator_cache[sr]
 
     pairs = build_pair_list(cfg, args.test_clean_json, args.test_noisy_json)
     print(f"Evaluating {len(pairs)} utterances at {sr} Hz")
 
-    samples_dir = os.path.join(args.output_dir, "samples")
+    samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
     sample_indices = set(range(min(args.num_samples, len(pairs))))
 
-    metric_names = (
-        "pesq",
-        "mrstft",
-        "utmos",
-        "distillmos",
-        "nisqa",
-        "sisdr",
-        "lsd",
-        "estoi",
-        "magnitude",
-        "phase",
-        "phase_ip",
-        "phase_gd",
-        "phase_iaf",
-        "complex",
-    )
+    metric_names = METRIC_NAMES
     sums = {m: 0.0 for m in metric_names}
+    sumsq = {m: 0.0 for m in metric_names}
     counts = {m: 0 for m in metric_names}
     per_utt = []
 
@@ -222,6 +258,7 @@ def main():
             "mrstft": metrics.mrstft,
             "utmos": metrics.utmos,
             "distillmos": metrics.distillmos,
+            "dnsmospro": metrics.dnsmospro,
             "nisqa": metrics.nisqa,
             "sisdr": metrics.sisdr,
             "lsd": metrics.lsd,
@@ -238,6 +275,7 @@ def main():
             v = row[m]
             if v is not None and not math.isnan(v):
                 sums[m] += v
+                sumsq[m] += v * v
                 counts[m] += 1
 
         if i in sample_indices:
@@ -267,6 +305,13 @@ def main():
             print(f"  [{i + 1}/{len(pairs)}] {stats}")
 
     means = {m: sums[m] / max(counts[m], 1) for m in metric_names}
+    # Sample variance (ddof=1); 0.0 when fewer than two valid values.
+    variances = {
+        m: (sumsq[m] - sums[m] * sums[m] / counts[m]) / (counts[m] - 1)
+        if counts[m] > 1
+        else 0.0
+        for m in metric_names
+    }
     summary = {
         "checkpoint": ckpt_file,
         "config": config_file,
@@ -274,36 +319,109 @@ def main():
         "num_utterances": len(pairs),
         "valid_counts": counts,
         **{f"mean_{m}": means[m] for m in metric_names},
+        **{f"var_{m}": variances[m] for m in metric_names},
         "samples_dir": samples_dir,
     }
-    out_json = os.path.join(args.output_dir, "metrics.json")
+    out_json = os.path.join(output_dir, "metrics.json")
     with open(out_json, "w") as f:
         json.dump({"summary": summary, "per_utterance": per_utt}, f, indent=2)
 
     print()
-    labels = {
-        "pesq": "PESQ",
-        "mrstft": "MR-STFT",
-        "utmos": "UTMOS",
-        "distillmos": "DistillMOS",
-        "nisqa": "NISQA",
-        "sisdr": "SI-SDR",
-        "lsd": "LSD",
-        "estoi": "ESTOI",
-        "magnitude": "Magnitude",
-        "phase": "Phase",
-        "phase_ip": "Phase-IP",
-        "phase_gd": "Phase-GD",
-        "phase_iaf": "Phase-IAF",
-        "complex": "Complex",
-    }
     for m in metric_names:
         print(
-            f"Mean {labels[m]:<10}: {means[m]:.4f} "
+            f"Mean {METRIC_LABELS[m]:<10}: {means[m]:.4f} (var {variances[m]:.4g}) "
             f"over {counts[m]}/{len(pairs)} utts"
         )
     print(f"Samples      : {samples_dir} ({len(sample_indices)} clips)")
     print(f"Per-utt log  : {out_json}")
+    return summary
+
+
+def print_comparison_table(summaries: dict[str, dict]):
+    """Print a name x mean-metric table, one row per checkpoint."""
+    if not summaries:
+        return
+    # Column widths driven by the longest checkpoint name.
+    name_w = max(len("checkpoint"), max(len(n) for n in summaries))
+    header = "  ".join(
+        [f"{'checkpoint':<{name_w}}"] + [f"{METRIC_LABELS[m]:>10}" for m in METRIC_NAMES]
+    )
+    print("\n" + "=" * len(header))
+    print("COMPARISON (means)")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for name, summ in summaries.items():
+        cells = [f"{name:<{name_w}}"]
+        for m in METRIC_NAMES:
+            cells.append(f"{summ[f'mean_{m}']:>10.4f}")
+        print("  ".join(cells))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        default="ckpts/SEMamba_advanced.pth",
+        help=(
+            "A .pth file, a single checkpoint directory (holds *.pth + config.yaml "
+            "or g_*.pth), or a parent directory of such dirs (evaluates + compares all)."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML config. Defaults to config.yaml next to the checkpoint.",
+    )
+    parser.add_argument("--test_clean_json", default=None)
+    parser.add_argument("--test_noisy_json", default=None)
+    parser.add_argument("--output_dir", default="eval_out")
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=10,
+        help="Number of fixed enhanced clips to save (alongside noisy/clean refs).",
+    )
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    evaluator_cache: dict = {}
+
+    # Compare mode: a parent directory of checkpoint dirs (ckpts/mamba, ...).
+    if os.path.isdir(args.checkpoint) and not is_checkpoint_dir(args.checkpoint):
+        ckpt_dirs = find_checkpoint_dirs(args.checkpoint)
+        if not ckpt_dirs:
+            raise FileNotFoundError(
+                f"No checkpoint directories (with *.pth) found under {args.checkpoint}"
+            )
+        print(f"Comparing {len(ckpt_dirs)} checkpoints under {args.checkpoint}:")
+        for d in ckpt_dirs:
+            print(f"  - {os.path.basename(d)}")
+
+        summaries: dict[str, dict] = {}
+        for d in ckpt_dirs:
+            name = os.path.basename(d.rstrip("/"))
+            print(f"\n{'#' * 60}\n# {name}\n{'#' * 60}")
+            ckpt_file, config_file = resolve_checkpoint_and_config(d, args.config)
+            out_dir = os.path.join(args.output_dir, name)
+            summaries[name] = evaluate_checkpoint(
+                ckpt_file, config_file, out_dir, args, device, evaluator_cache
+            )
+
+        comparison_json = os.path.join(args.output_dir, "comparison.json")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(comparison_json, "w") as f:
+            json.dump(summaries, f, indent=2)
+        print_comparison_table(summaries)
+        print(f"\nComparison   : {comparison_json}")
+        return
+
+    # Single-checkpoint mode.
+    ckpt_file, config_file = resolve_checkpoint_and_config(args.checkpoint, args.config)
+    evaluate_checkpoint(
+        ckpt_file, config_file, args.output_dir, args, device, evaluator_cache
+    )
 
 
 if __name__ == "__main__":

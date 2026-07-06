@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import distillmos
+import librosa
+import numpy as np
 import torch
 from auraloss.freq import MultiResolutionSTFTLoss
 from torchmetrics.audio import (
@@ -18,6 +20,13 @@ _LSD_HOP = 256
 
 HPC_ALEX_SPEECHMOS_PATH = "/home/hpc/f102ac/f102ac13/dev/SEMambaXLinOSS/SpeechMOS"
 
+# DNSMOS Pro (https://github.com/fcumlin/DNSMOSPro): non-intrusive MOS predictor.
+# TorchScript checkpoint (NISQA-trained, ~340 KB) auto-downloaded to the torch.hub
+# cache; set DNSMOSPRO_MODEL_PATH to a local .pt on offline/HPC nodes.
+DNSMOSPRO_MODEL_URL = (
+    "https://raw.githubusercontent.com/fcumlin/DNSMOSPro/main/runs/NISQA/model_best.pt"
+)
+
 
 @dataclass
 class EvalMetrics:
@@ -30,6 +39,7 @@ class EvalMetrics:
     sisdr: float | None = None
     lsd: float | None = None
     estoi: float | None = None
+    dnsmospro: float | None = None
 
 
 class Evaluator:
@@ -52,6 +62,7 @@ class Evaluator:
         self._sisdr = ScaleInvariantSignalDistortionRatio()
         self._estoi = ShortTimeObjectiveIntelligibility(sr, extended=True)
         self._distillmos = distillmos.ConvTransformerSQAModel().eval()
+        self._dnsmospro_model = self._load_dnsmospro()
 
         self._pesq_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -66,6 +77,38 @@ class Evaluator:
             # PESQ raises on silent/degenerate utterances (common early in training).
             print(f"Error computing PESQ score: {e}")
             return -1.0
+
+    @staticmethod
+    def _load_dnsmospro():
+        """Load the DNSMOS Pro (NISQA-trained) TorchScript predictor.
+
+        Uses a local checkpoint from ``DNSMOSPRO_MODEL_PATH`` when set (for
+        offline/HPC nodes); otherwise downloads it once into the torch.hub cache.
+        """
+        path = os.environ.get("DNSMOSPRO_MODEL_PATH")
+        if not path:
+            cache_dir = os.path.join(torch.hub.get_dir(), "checkpoints")
+            os.makedirs(cache_dir, exist_ok=True)
+            path = os.path.join(cache_dir, "dnsmospro_nisqa_model_best.pt")
+            if not os.path.exists(path):
+                torch.hub.download_url_to_file(DNSMOSPRO_MODEL_URL, path)
+        return torch.jit.load(path, map_location="cpu").eval()
+
+    def _dnsmospro_score(self, pred):
+        """Mean DNSMOS Pro MOS over the batch as a 0-dim tensor.
+
+        Non-intrusive (scores ``pred`` only). Reproduces the repo's log-magnitude
+        STFT front end (n_fft=320 / hop=160, |STFT| clipped to [1e-7, 1e7], log10,
+        time-major) so the predictor sees its training-time input distribution.
+        """
+        scores = []
+        for wav in pred:
+            samples = wav.detach().cpu().numpy()
+            spec = librosa.stft(y=samples, win_length=320, hop_length=160, n_fft=320)
+            spec = np.log10(np.clip(np.abs(spec.T), 1e-7, 1e7))
+            spec = torch.from_numpy(spec).float().to(self._device)
+            scores.append(self._dnsmospro_model(spec[None, None, ...])[0, 0])
+        return torch.stack(scores).mean()
 
     def compute_val(self, clean, pred):
         """Fast batched metrics for the in-training validation loop.
@@ -136,6 +179,10 @@ class Evaluator:
         if keep("distillmos"):
             with torch.no_grad():
                 distillmos_score = self._distillmos(pred).mean()
+        dnsmospro_score = None
+        if keep("dnsmospro"):
+            with torch.no_grad():
+                dnsmospro_score = self._dnsmospro_score(pred)
 
         if not as_tensor:
             t = lambda x: None if x is None else x.item()  # noqa: E731
@@ -143,6 +190,7 @@ class Evaluator:
             utmos_score, sisdr_score = t(utmos_score), t(sisdr_score)
             lsd_score, distillmos_score = t(lsd_score), t(distillmos_score)
             nisqa_score, estoi_score = t(nisqa_score), t(estoi_score)
+            dnsmospro_score = t(dnsmospro_score)
 
         return EvalMetrics(
             mrstft_loss,
@@ -153,6 +201,7 @@ class Evaluator:
             sisdr_score,
             lsd_score,
             estoi_score,
+            dnsmospro_score,
         )
 
     def to(self, device) -> "Evaluator":
@@ -164,4 +213,5 @@ class Evaluator:
         self._sisdr.to(device)
         self._estoi.to(device)
         self._distillmos.to(device)
+        self._dnsmospro_model.to(device)
         return self

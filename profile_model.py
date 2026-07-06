@@ -4,15 +4,26 @@ Builds the model exactly like ``evaluate.py`` (same config/checkpoint plumbing),
 then runs the generator on a single synthetic utterance to measure FLOPs via
 PyTorch's built-in ``FlopCounterMode`` and to time the forward and backward passes.
 
+Supports the same checkpoint layouts as ``evaluate.py``:
+  * a single ``.pth`` file,
+  * a checkpoint directory (holds ``*.pth`` + ``config.yaml`` or ``g_*.pth``),
+  * a *parent* directory of such checkpoint dirs (e.g. ``ckpts/``): every
+    checkpoint under it is profiled and a comparison table is printed.
+
 Examples:
     # From an exp dir (uses the co-located config.yaml; weights optional for FLOPs)
     python profile_model.py --checkpoint exp/MyRun
 
     # From a bare config, no trained weights needed
-    python profile_model.py --config recipes/la  -test.yaml --no-load-weights
+    python profile_model.py --config recipes/latest-test.yaml --no-load-weights
+
+    # Profile + compare every checkpoint under a parent directory
+    python profile_model.py --checkpoint ckpts
 """
 
 import argparse
+import json
+import os
 import time
 import warnings
 
@@ -26,7 +37,12 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
-from evaluate import load_generator, resolve_checkpoint_and_config
+from evaluate import (
+    find_checkpoint_dirs,
+    is_checkpoint_dir,
+    load_generator,
+    resolve_checkpoint_and_config,
+)
 from models.generator import SEMamba
 from models.stfts import mag_phase_stft
 from utils.util import load_config
@@ -87,60 +103,29 @@ def time_passes(model, mag, pha, runs: int, warmup: int, device: torch.device):
     return fwd[len(fwd) // 2] * 1e3, fwd_bwd[len(fwd_bwd) // 2] * 1e3
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help="A .pth file or an exp dir with g_*.pth. Used to locate config and "
-        "(optionally) load weights. FLOPs/params do not depend on the weights.",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="YAML config. Defaults to config.yaml next to the checkpoint.",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=1.0,
-        help="Length of the single synthetic sample, in seconds (sets the time axis).",
-    )
-    parser.add_argument(
-        "--no-load-weights",
-        action="store_true",
-        help="Skip loading checkpoint weights (just build from config).",
-    )
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=20,
-        help="Timed iterations (median reported) for forward and backward passes.",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=5,
-        help="Untimed warmup iterations before timing (lets CUDA kernels autotune).",
-    )
-    parser.add_argument(
-        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    args = parser.parse_args()
+def mixer_name(cfg: dict) -> str:
+    """Human-readable mixer, matching TFMambaBlock's per-axis resolution.
 
-    if args.config is None and args.checkpoint is None:
-        parser.error("provide --config and/or --checkpoint")
+    Mixer is keyed 'ssm' (default 'mamba'); hybrid configs override per axis
+    via 'time_mixer'/'freq_mixer' sub-dicts.
+    """
+    mcfg = cfg["model_cfg"]
+    time_ssm = mcfg.get("time_mixer", mcfg).get("ssm", "mamba")
+    freq_ssm = mcfg.get("freq_mixer", mcfg).get("ssm", "mamba")
+    return time_ssm if time_ssm == freq_ssm else f"time={time_ssm}, freq={freq_ssm}"
 
-    device = torch.device(args.device)
 
-    # Resolve config (and checkpoint) the same way evaluate.py does.
-    ckpt_file = None
-    if args.checkpoint is not None:
-        ckpt_file, config_file = resolve_checkpoint_and_config(
-            args.checkpoint, args.config
-        )
-    else:
-        config_file = args.config
+def profile_checkpoint(
+    ckpt_file: str | None,
+    config_file: str,
+    args,
+    device: torch.device,
+) -> dict:
+    """Profile one checkpoint/config; print the report and return a summary dict.
+
+    ``ckpt_file`` may be ``None`` (config-only) or skipped via ``--no-load-weights``,
+    in which case a randomly-initialised model is built (FLOPs/params are unaffected).
+    """
     print(f"Config     : {config_file}")
     cfg = load_config(config_file)
 
@@ -155,12 +140,7 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Mixer is keyed 'ssm' (default 'mamba'); hybrid configs override per axis
-    # via 'time_mixer'/'freq_mixer' sub-dicts (see TFMambaBlock).
-    mcfg = cfg["model_cfg"]
-    time_ssm = mcfg.get("time_mixer", mcfg).get("ssm", "mamba")
-    freq_ssm = mcfg.get("freq_mixer", mcfg).get("ssm", "mamba")
-    mixer = time_ssm if time_ssm == freq_ssm else f"time={time_ssm}, freq={freq_ssm}"
+    mixer = mixer_name(cfg)
 
     print()
     print(f"Mixer        : {mixer}")
@@ -208,6 +188,156 @@ def main():
     print(f"Time (bwd)   : {bwd_ms:.3f} ms")
     print(f"Time (f+b)   : {fwd_bwd_ms:.3f} ms"
           f"  (median of {args.runs} runs, {args.warmup} warmup)")
+
+    return {
+        "checkpoint": ckpt_file,
+        "config": config_file,
+        "mixer": mixer,
+        "params_total": total,
+        "params_trainable": trainable,
+        "gflops_fwd": fwd_flops / 1e9,
+        "gflops_bwd": bwd_flops / 1e9,
+        "gflops_fb": fwd_bwd_flops / 1e9,
+        "time_fwd_ms": fwd_ms,
+        "time_bwd_ms": bwd_ms,
+        "time_fb_ms": fwd_bwd_ms,
+    }
+
+
+# (column label, summary key, format spec) for the comparison table.
+COMPARE_COLUMNS = (
+    ("Mixer", "mixer", ">18s"),
+    ("Params", "params_total", ">12,d"),
+    ("GFLOPs(fwd)", "gflops_fwd", ">11.3f"),
+    ("GFLOPs(f+b)", "gflops_fb", ">11.3f"),
+    ("Fwd ms", "time_fwd_ms", ">10.3f"),
+    ("Bwd ms", "time_bwd_ms", ">10.3f"),
+    ("F+b ms", "time_fb_ms", ">10.3f"),
+)
+
+
+def print_comparison_table(summaries: dict[str, dict]):
+    """Print a name x profile-metric table, one row per checkpoint."""
+    if not summaries:
+        return
+    name_w = max(len("checkpoint"), max(len(n) for n in summaries))
+    widths = [max(len(lbl), 18) for lbl, _, _ in COMPARE_COLUMNS]
+    header = "  ".join(
+        [f"{'checkpoint':<{name_w}}"]
+        + [f"{lbl:>{w}}" for (lbl, _, _), w in zip(COMPARE_COLUMNS, widths)]
+    )
+    print("\n" + "=" * len(header))
+    print("COMPARISON")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for name, summ in summaries.items():
+        cells = [f"{name:<{name_w}}"]
+        for (_, key, spec), w in zip(COMPARE_COLUMNS, widths):
+            cells.append(f"{format(summ[key], spec):>{w}}")
+        print("  ".join(cells))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="A .pth file, a checkpoint dir (with *.pth + config.yaml or g_*.pth), or a "
+        "parent directory of such dirs (profiles + compares all). Used to locate config "
+        "and (optionally) load weights. FLOPs/params do not depend on the weights.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML config. Defaults to config.yaml next to the checkpoint.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=1.0,
+        help="Length of the single synthetic sample, in seconds (sets the time axis).",
+    )
+    parser.add_argument(
+        "--no-load-weights",
+        action="store_true",
+        help="Skip loading checkpoint weights (just build from config).",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=20,
+        help="Timed iterations (median reported) for forward and backward passes.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="Untimed warmup iterations before timing (lets CUDA kernels autotune).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="If set (compare mode), write the gathered summaries to "
+        "<output_dir>/profile_comparison.json.",
+    )
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    args = parser.parse_args()
+
+    if args.config is None and args.checkpoint is None:
+        parser.error("provide --config and/or --checkpoint")
+
+    device = torch.device(args.device)
+
+    # Compare mode: a parent directory of checkpoint dirs (ckpts/mamba, ...).
+    if (
+        args.checkpoint is not None
+        and os.path.isdir(args.checkpoint)
+        and not is_checkpoint_dir(args.checkpoint)
+    ):
+        ckpt_dirs = find_checkpoint_dirs(args.checkpoint)
+        if not ckpt_dirs:
+            raise FileNotFoundError(
+                f"No checkpoint directories (with *.pth) found under {args.checkpoint}"
+            )
+        print(f"Profiling {len(ckpt_dirs)} checkpoints under {args.checkpoint}:")
+        for d in ckpt_dirs:
+            print(f"  - {os.path.basename(d)}")
+
+        summaries: dict[str, dict] = {}
+        for d in ckpt_dirs:
+            name = os.path.basename(d.rstrip("/"))
+            print(f"\n{'#' * 60}\n# {name}\n{'#' * 60}")
+            ckpt_file, config_file = resolve_checkpoint_and_config(d, args.config)
+            summaries[name] = profile_checkpoint(ckpt_file, config_file, args, device)
+
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            comparison_json = os.path.join(args.output_dir, "profile_comparison.json")
+            with open(comparison_json, "w") as f:
+                json.dump(summaries, f, indent=2)
+        print_comparison_table(summaries)
+        if args.output_dir:
+            print(f"\nComparison   : {comparison_json}")
+        print(
+            "\nNote: FlopCounterMode tracks ATen ops; custom Mamba/LinOSS scan CUDA/"
+            "Triton\nkernels are not counted, so the recurrence cost is excluded from "
+            "FLOPs\n(but is included in the wall-clock timing)."
+        )
+        return
+
+    # Single-checkpoint (or config-only) mode.
+    ckpt_file = None
+    if args.checkpoint is not None:
+        ckpt_file, config_file = resolve_checkpoint_and_config(
+            args.checkpoint, args.config
+        )
+    else:
+        config_file = args.config
+
+    profile_checkpoint(ckpt_file, config_file, args, device)
 
     print(
         "\nNote: FlopCounterMode tracks ATen ops; custom Mamba/LinOSS scan CUDA/"
