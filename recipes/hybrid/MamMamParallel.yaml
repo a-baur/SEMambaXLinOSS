@@ -1,0 +1,22 @@
+# LinMamParallel -- inherits shared config from base.yaml; only the mixer block differs.
+base: ../base.yaml
+
+model_cfg:
+  use_phase_fan: false
+  use_fan_denseblock: false
+  ssm: hybrid
+  hybrid:
+    mode: parallel
+    gate_hidden: null
+  backbone_1:
+    ssm: mamba
+    d_state: 16
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+  backbone_2:
+    ssm: mamba
+    d_state: 16
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
