@@ -4,15 +4,15 @@ base: ../base.yaml
 model_cfg:
   use_phase_fan: false
   use_fan_denseblock: false
-  d_state: 48
+  d_state: 256
   d_conv: 4
-  expand: 2
+  expand: 1
   norm_epsilon: 1.0e-05
   causal_conv: true
   ssm: selective_lru_mimo
   ssm_params:
     n_heads: 4
-    rank: 1
+    rank: 0
     r_min: 0.9
     theta_max: 3.141592653589793
     use_triton: true
