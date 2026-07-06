@@ -210,11 +210,7 @@ def _build_mixer_cls(d_model, model_cfg, layer_idx=0):
         ssm = SelectiveLRUMIMO(
             in_features=expand * d_model,
             state_dim=d_state,
-            r_min=ssm_params.get("r_min", 0.9),
-            theta_max=ssm_params.get("theta_max", math.pi),
-            selective_init_std=ssm_params.get("init_std", 1e-2),
-            normalize_input=ssm_params.get("normalize_input", True),
-            use_triton=ssm_params.get("use_triton", False),
+            **ssm_params,
         )
         mixer_cls = partial(
             MambaStyleMixer,

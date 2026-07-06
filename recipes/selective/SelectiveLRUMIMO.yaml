@@ -4,17 +4,17 @@ base: ../base.yaml
 model_cfg:
   use_phase_fan: false
   use_fan_denseblock: false
-  d_state: 64
+  d_state: 48
   d_conv: 4
   expand: 2
   norm_epsilon: 1.0e-05
   causal_conv: true
   ssm: selective_lru_mimo
   ssm_params:
-    discretization: IMEX
-    damping: true
+    n_heads: 4
+    rank: 1
     r_min: 0.9
     theta_max: 3.141592653589793
     use_triton: true
-    init_std: 0.01
+    selective_init_std: 0.01
     normalize_input: true
