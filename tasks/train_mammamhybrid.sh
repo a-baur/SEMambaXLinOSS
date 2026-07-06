@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --ntasks=1
 #SBATCH --partition=a100
-#SBATCH --job-name=mamba
+#SBATCH --job-name=mammamhybrid
 #SBATCH --output=jobs/%x-%j.out
 #SBATCH --error=jobs/%x-%j.err
 #SBATCH --time=23:59:00

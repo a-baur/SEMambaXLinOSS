@@ -1,5 +1,3 @@
-# Sourced by the tasks/train_*.sh sbatch scripts to enable auto-requeue.
-#
 # SLURM caps jobs at 24 h. `run_with_requeue <cmd...>` runs the training command
 # under a SIGUSR1 handler that requeues the job just before the wall-clock limit.
 # The requeued job keeps the same JobID and re-runs the same script, so train.py
