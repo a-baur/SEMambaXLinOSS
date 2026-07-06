@@ -369,6 +369,27 @@ class MambaBlock(nn.Module):
         return torch.cat([y_forward, y_backward], -1)
 
 
+def _layer_spec_matches(spec, layer_idx, num_layers):
+    """Whether ``layer_idx`` is selected by a ``layers`` override spec.
+
+    Each element of ``spec`` is either an int (negative counts from the end, so
+    ``-1`` is the deepest layer) or an inclusive range string ``"a-b"`` with
+    non-negative bounds.
+    """
+    for item in spec:
+        if isinstance(item, str) and "-" in item.strip().lstrip("-"):
+            lo_s, hi_s = item.split("-")
+            if int(lo_s) <= layer_idx <= int(hi_s):
+                return True
+        else:
+            idx = int(item)
+            if idx < 0:
+                idx += num_layers
+            if idx == layer_idx:
+                return True
+    return False
+
+
 class TFMambaBlock(nn.Module):
     """Temporal-Frequency Mamba block for sequence modeling.
 
@@ -380,21 +401,25 @@ class TFMambaBlock(nn.Module):
     flinear (ConvTranspose1d): ConvTranspose1d layer for frequency dimension.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, layer_idx=0, num_layers=1):
         super(TFMambaBlock, self).__init__()
         self.cfg = cfg
+        self.layer_idx = layer_idx
         self.hid_feature = cfg["model_cfg"]["hid_feature"]
 
-        # Initialize Mamba blocks. Per-axis mixer sub-dicts ('time_mixer' /
-        # 'freq_mixer') enable a LinOSS/Mamba hybrid; older flat configs fall
-        # back to model_cfg itself (same shape create_block expects).
         mcfg = cfg["model_cfg"]
-        self.time_mamba = MambaBlock(
-            in_channels=self.hid_feature, cfg=mcfg.get("time_mixer", mcfg)
-        )
-        self.freq_mamba = MambaBlock(
-            in_channels=self.hid_feature, cfg=mcfg.get("freq_mixer", mcfg)
-        )
+        time_cfg = mcfg.get("time_mixer", mcfg)
+        freq_cfg = mcfg.get("freq_mixer", mcfg)
+
+        for override in mcfg.get("layer_overrides") or []:
+            if _layer_spec_matches(override.get("layers", []), layer_idx, num_layers):
+                if "time_mixer" in override:
+                    time_cfg = override["time_mixer"]
+                if "freq_mixer" in override:
+                    freq_cfg = override["freq_mixer"]
+
+        self.time_mamba = MambaBlock(in_channels=self.hid_feature, cfg=time_cfg)
+        self.freq_mamba = MambaBlock(in_channels=self.hid_feature, cfg=freq_cfg)
 
         # Initialize ConvTranspose1d layers
         self.tlinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)

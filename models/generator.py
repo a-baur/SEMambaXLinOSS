@@ -26,7 +26,12 @@ class SEMamba(nn.Module):
         self.dense_encoder = DenseEncoder(cfg)
 
         # Initialize Mamba blocks
-        self.TSMamba = nn.ModuleList([TFMambaBlock(cfg) for _ in range(self.num_tscblocks)])
+        self.TSMamba = nn.ModuleList(
+            [
+                TFMambaBlock(cfg, layer_idx=i, num_layers=self.num_tscblocks)
+                for i in range(self.num_tscblocks)
+            ]
+        )
 
         # Initialize decoders
         self.mask_decoder = MagDecoder(cfg)

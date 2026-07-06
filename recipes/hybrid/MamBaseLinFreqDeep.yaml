@@ -1,0 +1,39 @@
+# MamBaseLinFreqDeep -- Mamba on both axes at every depth, but the frequency
+# axis of the deepest layer(s) is replaced by LinOSS. Tests the hypothesis that
+# shallow layers need Mamba's selectivity (denoise) while the already-cleaned
+# signal benefits from LinOSS's oscillatory structure on the frequency axis at
+# depth. Inherits shared config from base.yaml.
+base: ../base.yaml
+
+model_cfg:
+  use_phase_fan: false
+  use_fan_denseblock: false
+
+  # Base mixer: Mamba on both time and frequency axes (flat config; both axes
+  # fall back to this when no time_mixer/freq_mixer is given).
+  ssm: mamba
+  d_state: 16
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 1.0e-05
+
+  # Per-layer overrides. `layers` accepts ints (negative counts from the end,
+  # so -1 is the deepest of num_tfmamba layers) and inclusive range strings
+  # like "2-3". Here: only the deepest layer swaps its freq axis to LinOSS.
+  # For the deepest two layers instead, use `layers: [-2, -1]` or `["2-3"]`.
+  layer_overrides:
+    - layers: [-1]
+      freq_mixer:
+        ssm: linoss
+        d_state: 64
+        d_conv: 4
+        expand: 2
+        norm_epsilon: 1.0e-05
+        causal_conv: true
+        ssm_params:
+          discretization: IMEX
+          damping: true
+          r_min: 0.9
+          theta_max: 3.141592653589793
+          a_from_g: true
+          use_triton: true
