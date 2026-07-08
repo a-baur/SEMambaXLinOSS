@@ -97,3 +97,41 @@ class MambaStyleMixer(nn.Module):
         y = self.ssm(u)                       # (B, T, inner_dim)
         y = y * F.silu(z)
         return self.out_proj(y)               # (B, T, in_features)
+
+
+
+class LinOSSStyleMixer(nn.Module):
+
+    def __init__(
+        self,
+        in_features: int,
+        ssm: torch.nn.Module,
+        expand: int = 4,
+        iterations: int = 1,
+    ):
+        super().__init__()
+        inner_dim = expand * in_features
+        self.in_features = in_features
+        self.inner_dim = inner_dim
+        self.iterations = iterations
+
+        self.in_proj = nn.Linear(in_features, inner_dim, bias=False)
+
+        self.ssm = ssm
+
+        self.gelu = nn.GELU()
+        self.glu_w1 = nn.Linear(inner_dim, inner_dim)
+        self.glu_w2 = nn.Linear(inner_dim, inner_dim)
+
+        self.out_proj = nn.Linear(inner_dim, in_features, bias=False)
+
+    def forward(self, x: torch.Tensor, inference_params=None) -> torch.Tensor:
+        del inference_params
+        x = self.in_proj(x)                  # (B, T, 2*inner_dim)
+
+        skip = x
+        x = self.ssm(x)
+        x = self.gelu(x)
+        x = torch.sigmoid(self.glu_w1(x)) * self.glu_w2(x) + skip
+
+        return self.out_proj(x)               # (B, T, in_features)

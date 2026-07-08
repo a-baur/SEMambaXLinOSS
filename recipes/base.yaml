@@ -67,6 +67,7 @@ stft_cfg:
 # its own mixer block (ssm, d_state, expand, ssm_params, ...) via model_cfg.
 model_cfg:
   hid_feature: 64  # Channels in dense layers.
+  dense_stride: 2
   compress_factor: 0.3  # Compression factor applied to extracted features.
   num_tfmamba: 4  # Number of Time-Frequency blocks in the model.
   beta: 2.0  # Hyperparameter for the Learnable Sigmoid function.

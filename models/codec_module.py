@@ -146,6 +146,8 @@ class DenseEncoder(nn.Module):
         self.input_channel = cfg["model_cfg"]["input_channel"]
         self.hid_feature = cfg["model_cfg"]["hid_feature"]
 
+        self.stride = cfg["model_cfg"].get("dense_stride", 2)
+
         self.use_phase_fan = cfg["model_cfg"].get("use_phase_fan", False)
         self.use_fan_denseblock = cfg["model_cfg"].get("use_fan_denseblock", False)
 
@@ -169,7 +171,7 @@ class DenseEncoder(nn.Module):
         self.dense_block = block_cls(cfg, depth=4)
 
         self.dense_conv_2 = nn.Sequential(
-            nn.Conv2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, 2)),
+            nn.Conv2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, self.stride)),
             nn.InstanceNorm2d(self.hid_feature, affine=True),
             nn.PReLU(self.hid_feature),
         )
@@ -201,9 +203,10 @@ class MagDecoder(nn.Module):
         self.output_channel = cfg['model_cfg']['output_channel']
         self.n_fft = cfg['stft_cfg']['n_fft']
         self.beta = cfg['model_cfg']['beta']
+        self.stride = cfg["model_cfg"].get("dense_stride", 2)
 
         self.mask_conv = nn.Sequential(
-            nn.ConvTranspose2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, 2)),
+            nn.ConvTranspose2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, self.stride)),
             nn.Conv2d(self.hid_feature, self.output_channel, (1, 1)),
             nn.InstanceNorm2d(self.output_channel, affine=True),
             nn.PReLU(self.output_channel),
@@ -237,9 +240,10 @@ class PhaseDecoder(nn.Module):
         self.dense_block = DenseBlock(cfg, depth=4)
         self.hid_feature = cfg['model_cfg']['hid_feature']
         self.output_channel = cfg['model_cfg']['output_channel']
+        self.stride = cfg["model_cfg"].get("dense_stride", 2)
 
         self.phase_conv = nn.Sequential(
-            nn.ConvTranspose2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, 2)),
+            nn.ConvTranspose2d(self.hid_feature, self.hid_feature, (1, 3), stride=(1, self.stride)),
             nn.InstanceNorm2d(self.hid_feature, affine=True),
             nn.PReLU(self.hid_feature)
         )
