@@ -18,6 +18,6 @@ source tasks/_env.sh
 source tasks/_requeue.sh
 
 run_with_requeue srun --unbuffered --ntasks=1 python -u train.py \
-  --config recipes/selective/SelectiveLRUMIMO_learnfreq.yaml \
+  --config recipes/selective/MamTimeSelLRUFreq.yaml \
   --exp_folder /home/atuin/f102ac/f102ac13/SEMambaBackbones/ \
-  --exp_name SelectiveLRU-MIMO_learnfreq
+  --exp_name MamTimeSelLRUFreq

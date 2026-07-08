@@ -1,0 +1,28 @@
+# MamTimeLinFreq -- inherits shared config from base.yaml; only the mixer block differs.
+base: ../base.yaml
+
+model_cfg:
+  time_mixer:
+    ssm: mamba
+    d_state: 16
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+  freq_mixer:
+    d_state: 48
+    d_conv: 4
+    expand: 2
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    ssm: selective_lru_mimo
+    ssm_params:
+      n_heads: 4
+      rank: 1
+      r_min: 0.9
+      theta_max: 3.141592653589793
+      use_triton: true
+      selective_init_std: 0.01
+      normalize_input: true
+      phase_mode: selective  # "selective" | "learnable" | "fixed"
+      phase_value: 0.0  # radians; only used when phase_mode == "fixed"
+      compile_surround: true  # torch.compile the pre/post-scan surround (speeds fwd; adds warmup)
