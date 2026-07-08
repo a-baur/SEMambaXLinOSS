@@ -1,0 +1,47 @@
+# SelectiveLRUMIMO with axis-split phase selectivity:
+#   time axis  -> fully selective LRU (input-dependent phase)
+#   freq axis  -> selective LRU with LEARNABLE (input-independent) phase
+# Rationale: the frequency-scan input swings sharply bin-to-bin, so a fully
+# input-dependent pole phase jitters and destroys coherent mid-band accumulation
+# (see chirp/two-tone probes). Freezing the frequency-axis phase to a learnable
+# but input-independent value keeps magnitude/gate selectivity while restoring
+# coherent full-band reconstruction. Time axis stays fully selective.
+base: ../base.yaml
+
+model_cfg:
+  time_mixer:
+    d_state: 48
+    d_conv: 4
+    expand: 2
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    ssm: selective_lru_mimo
+    ssm_params:
+      n_heads: 4
+      rank: 1
+      r_min: 0.9
+      theta_max: 3.141592653589793
+      use_triton: true
+      selective_init_std: 0.01
+      normalize_input: true
+      phase_mode: selective  # fully selective: input-dependent phase
+      phase_value: 0.0  # radians; only used when phase_mode == "fixed"
+      compile_surround: true  # torch.compile the pre/post-scan surround (speeds fwd; adds warmup)
+  freq_mixer:
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    norm_epsilon: 1.0e-05
+    causal_conv: false
+    ssm: selective_lru_mimo
+    ssm_params:
+      n_heads: 4
+      rank: 1
+      r_min: 0.9
+      theta_max: 3.141592653589793
+      use_triton: true
+      selective_init_std: 0.01
+      normalize_input: true
+      phase_mode: learnable  # per-mode learnable phase, NOT input-dependent (coherent across bins)
+      phase_value: 0.0
+      compile_surround: true

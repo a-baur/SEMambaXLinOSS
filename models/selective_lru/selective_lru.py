@@ -185,6 +185,19 @@ class SelectiveLRUMIMO(nn.Module):
         The scan itself is untouched (all corrections are feedthrough), so
         stability (|lambda| < 1 by construction) and the Triton kernel are
         unaffected.
+
+    Phase parameterization (``phase_mode``):
+        The pole phase ``theta`` (``lam = nu * e^{i*theta}``) can be:
+        - ``"selective"`` (default): input-dependent ``theta = theta_proj(x)``
+          — the original behavior.
+        - ``"learnable"``: a per-mode ``nn.Parameter`` of shape ``(state_dim,)``,
+          shared across time/batch (non-selective, still trained). Seeded with
+          the same ``[0, theta_max)`` ring spread as the selective bias.
+        - ``"fixed"``: a per-mode constant buffer (no grad) at ``phase_value``
+          radians (e.g. ``0`` -> pure decay, no oscillation).
+        Magnitude selectivity (``nu_proj``) is unaffected in all modes. Only the
+        construction of ``theta`` changes; the scan/kernel consume the finished
+        ``lam`` and need no changes.
     """
 
     def __init__(
@@ -199,28 +212,39 @@ class SelectiveLRUMIMO(nn.Module):
         selective_init_std: float = 1e-2,
         normalize_input: bool = True,
         use_triton: bool = False,
+        phase_mode: str = "selective",
+        phase_value: float = 0.0,
+        compile_surround: bool = False,
     ):
         super().__init__()
         if in_features % n_heads != 0:
             raise ValueError(f"in_features={in_features} not divisible by n_heads={n_heads}")
         if state_dim % n_heads != 0:
             raise ValueError(f"state_dim={state_dim} not divisible by n_heads={n_heads}")
+        if phase_mode not in ("selective", "learnable", "fixed"):
+            raise ValueError(
+                f"phase_mode={phase_mode!r} must be 'selective', 'learnable', or 'fixed'"
+            )
         self.in_features = in_features
         self.state_dim = state_dim
         self.n_heads = n_heads
         self.rank = rank
         self.normalize_input = normalize_input
         self.use_triton = use_triton
+        self.phase_mode = phase_mode
+        self.compile_surround = compile_surround
         self.f_head = in_features // n_heads   # channels per head (F_h)
         self.n_head = state_dim // n_heads     # modes per head (N_h)
 
         H, Nh, Fh = n_heads, self.n_head, self.f_head
 
-        # Pole selectivity: unchanged, over all state_dim = H * N_h modes. The
-        # nu/theta projections stay full-input (dense over F) so H=1 is exactly
-        # the old module and pole selectivity can use cross-head context.
         self.nu_proj = nn.Linear(in_features, state_dim)
-        self.theta_proj = nn.Linear(in_features, state_dim)
+        if phase_mode == "selective":
+            self.theta_proj = nn.Linear(in_features, state_dim)
+        elif phase_mode == "learnable":
+            self.theta = nn.Parameter(torch.empty(state_dim))
+        else:  # "fixed"
+            self.register_buffer("theta", torch.full((state_dim,), float(phase_value)))
 
         # Static block-diagonal B/C: head h maps its F_h channels to its N_h modes.
         B_std = 1.0 / math.sqrt(Fh)
@@ -231,86 +255,139 @@ class SelectiveLRUMIMO(nn.Module):
 
         # Rank-r additive selective B/C (skipped entirely when rank == 0).
         if rank > 0:
-            # Write directions b_t (real) and read vectors c_t (complex): full
-            # scale. Coefficients s^B, s^C: small init -> starts as static model.
             self.b_dir = nn.Linear(in_features, H * rank * Nh, bias=False)
             self.b_coef = nn.Linear(in_features, H * rank, bias=False)
             self.c_read = nn.Linear(in_features, 2 * H * rank * Nh, bias=False)
             self.c_coef = nn.Linear(in_features, H * rank, bias=False)
-            # Static per-rank output directions a^(h,i) in R^{F_h}.
-            self.c_out = nn.Parameter(_uniform_init((H, rank, Fh), std=1.0 / math.sqrt(Fh)))
+            # Stored 2D as (H*rank, Fh) rather than (H, rank, Fh): the size-1
+            # rank axis makes the 3D grad's strides ambiguous, which trips DDP's
+            # gradient-layout check. Viewed back to (H, rank, Fh) in _rank_read.
+            self.c_out = nn.Parameter(_uniform_init((H * rank, Fh), std=1.0 / math.sqrt(Fh)))
 
         with torch.no_grad():
             # Ring init of pole magnitudes in [r_min, r_max] (LRU), full phase spread.
             mags = torch.sqrt(torch.rand(state_dim) * (r_max ** 2 - r_min ** 2) + r_min ** 2)
             self.nu_proj.bias.copy_(torch.logit(mags))
-            self.theta_proj.bias.copy_(torch.rand(state_dim) * theta_max)
             self.nu_proj.weight.normal_(0.0, selective_init_std)
-            self.theta_proj.weight.normal_(0.0, selective_init_std)
+            if phase_mode == "selective":
+                self.theta_proj.bias.copy_(torch.rand(state_dim) * theta_max)
+                self.theta_proj.weight.normal_(0.0, selective_init_std)
+            elif phase_mode == "learnable":
+                self.theta.copy_(torch.rand(state_dim) * theta_max)
 
             if rank > 0:
                 self.b_dir.weight.normal_(0.0, 1.0 / math.sqrt(in_features))
                 self.c_read.weight.normal_(0.0, 1.0 / math.sqrt(in_features))
-                # Width-independent perturbation scale: coefficient std at init
-                # is ~selective_init_std regardless of in_features.
                 coef_std = selective_init_std / math.sqrt(in_features)
                 self.b_coef.weight.normal_(0.0, coef_std)
                 self.c_coef.weight.normal_(0.0, coef_std)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        Bsz, T, Fdim = x.shape
+        # Compile only the (fully real) pre-scan surround. _rank_read stays eager:
+        # its complex ops (torch.complex, complex einsum) can't be lowered by
+        # TorchInductor — it warns and falls back anyway — and compiling it emitted
+        # a non-contiguous c_out grad that trips DDP's gradient-layout check.
+        self._pre = torch.compile(self._pre_scan) if compile_surround else self._pre_scan
+        self._rank = self._rank_read
+
+    def _pre_scan(self, x: torch.Tensor):
+        """Everything before the scan: pole + input map, as split real/imag.
+
+        Returns ``(lam_re, lam_im, Bu_re, Bu_im)`` — each ``(B, T, N)`` real —
+        plus never materializing a complex tensor (``lam = nu*e^{i theta}`` is
+        written directly as ``nu*cos``/``nu*sin``).
+        """
+        Bsz, T, _ = x.shape
         H, Nh, Fh, r = self.n_heads, self.n_head, self.f_head, self.rank
 
         # Selective pole (magnitude strictly inside the unit disk).
         nu = torch.sigmoid(self.nu_proj(x))                    # (B, T, N)
-        theta = self.theta_proj(x)                             # (B, T, N)
-        lam = torch.polar(nu, theta)                           # (B, T, N) complex
+        if self.phase_mode == "selective":
+            theta = self.theta_proj(x)                         # (B, T, N)
+        else:
+            theta = self.theta                                 # (N,), broadcasts over (B, T)
+        lam_re = nu * torch.cos(theta)                         # (B, T, N)
+        lam_im = nu * torch.sin(theta)
 
         xh = x.view(Bsz, T, H, Fh)
 
-        # Static block-diagonal input map (complex weights x real input).
-        B_c = torch.complex(self.B[..., 0], self.B[..., 1])    # (H, Nh, Fh)
-        Bu = torch.complex(
-            torch.einsum("hnf,bthf->bthn", B_c.real, xh),
-            torch.einsum("hnf,bthf->bthn", B_c.imag, xh),
-        )                                                      # (B, T, H, Nh)
+        # Static block-diagonal input map (real/imag weights x real input).
+        Bu_re = torch.einsum("hnf,bthf->bthn", self.B[..., 0], xh)   # (B, T, H, Nh)
+        Bu_im = torch.einsum("hnf,bthf->bthn", self.B[..., 1], xh)
 
-        # Rank-r selective write: Bu += sum_i s^B_i * b_t^(i)  (real directions;
-        # phase behavior stays in the pole).
         if r > 0:
             s_b = self.b_coef(x).view(Bsz, T, H, r)            # ~0 at init
             b_t = self.b_dir(x).view(Bsz, T, H, r, Nh)
-            Bu = Bu + torch.einsum("bthr,bthrn->bthn", s_b, b_t).to(Bu.dtype)
+            Bu_re = Bu_re + torch.einsum("bthr,bthrn->bthn", s_b, b_t)
 
-        Bu = Bu.reshape(Bsz, T, self.state_dim)
+        Bu_re = Bu_re.reshape(Bsz, T, self.state_dim)
+        Bu_im = Bu_im.reshape(Bsz, T, self.state_dim)
         if self.normalize_input:
-            # Applied to the *total* input map (static + selective) so the
-            # LRU variance normalization stays valid with the correction on.
             gamma = torch.sqrt((1.0 - nu ** 2).clamp_min(1e-6))  # (B, T, N)
-            Bu = Bu * gamma
+            Bu_re = Bu_re * gamma
+            Bu_im = Bu_im * gamma
+
+        return lam_re, lam_im, Bu_re, Bu_im
+
+    def _rank_read(self, x, hh):
+        """Rank-r selective read correction ``sum_i s^C_i Re(<c_t^(i), h>) a^(i)``.
+
+        ``hh`` is the complex state viewed as ``(B, T, H, Nh)``. Returns the
+        additive correction shaped ``(B, T, Fd)``.
+        """
+        Bsz, T, Fdim = x.shape
+        H, Nh, r = self.n_heads, self.n_head, self.rank
+
+        s_c = self.c_coef(x).view(Bsz, T, H, r)                # ~0 at init
+        cr = self.c_read(x).view(Bsz, T, H, r, 2 * Nh)
+        c_t = torch.complex(cr[..., :Nh], cr[..., Nh:])        # (B, T, H, r, Nh)
+        read = torch.einsum("bthrn,bthn->bthr", c_t, hh).real
+        c_out = self.c_out.view(H, r, self.f_head)             # (H, rank, Fh)
+        corr = torch.einsum("bthr,hrf->bthf", s_c * read, c_out)
+        return corr.reshape(Bsz, T, Fdim)
+
+    def _post_scan(self, x, h_re, h_im):
+        """Reference (non-Triton) readout: ``Re(C h) + D x`` plus the rank read.
+
+        The Triton path folds the static ``Re(C h) + D x`` into the fused kernel;
+        this pure-PyTorch version is used for CPU / correctness.
+        """
+        Bsz, T, Fdim = x.shape
+        H, Nh = self.n_heads, self.n_head
+
+        hh = torch.complex(h_re, h_im).view(Bsz, T, H, Nh)
+
+        C_c = torch.complex(self.C[..., 0], self.C[..., 1])    # (H, Fh, Nh)
+        y = torch.einsum("hfn,bthn->bthf", C_c, hh).real.reshape(Bsz, T, Fdim)
+        y = y + x * self.D
+
+        if self.rank > 0:
+            y = y + self._rank_read(x, hh)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lam_re, lam_im, Bu_re, Bu_im = self._pre(x)
 
         if self.use_triton:
-            # Scan is unchanged by heads/rank: same kernel.
-            from models.selective_lru.selective_lru_mimo_triton import selective_scan_triton
-            h = selective_scan_triton(lam, Bu)                 # (B, T, N) complex
-        else:
-            h = _selective_recurrence(lam, Bu)                 # (B, T, N) complex
+            from models.selective_lru.selective_lru_mimo_triton import (
+                fused_selective_lru_mimo,
+            )
+            y, h_re, h_im = fused_selective_lru_mimo(
+                lam_re.contiguous(), lam_im.contiguous(),
+                Bu_re.contiguous(), Bu_im.contiguous(),
+                self.C[..., 0], self.C[..., 1], x, self.D,
+                self.n_heads, self.n_head, self.f_head,
+            )
+            if self.rank > 0:
+                hh = torch.complex(h_re, h_im).view(
+                    x.shape[0], x.shape[1], self.n_heads, self.n_head
+                )
+                y = y + self._rank(x, hh)
+            return y
 
-        hh = h.view(Bsz, T, H, Nh)
-
-        # Static block-diagonal readout.
-        C_c = torch.complex(self.C[..., 0], self.C[..., 1])    # (H, Fh, Nh)
-        y = torch.einsum("hfn,bthn->bthf", C_c, hh).real       # (B, T, H, Fh)
-
-        # Rank-r selective read: y += sum_i s^C_i * Re(<c_t^(i), h>) * a^(i).
-        if r > 0:
-            s_c = self.c_coef(x).view(Bsz, T, H, r)            # ~0 at init
-            cr = self.c_read(x).view(Bsz, T, H, r, 2 * Nh)
-            c_t = torch.complex(cr[..., :Nh], cr[..., Nh:])    # (B, T, H, r, Nh)
-            read = torch.einsum("bthrn,bthn->bthr", c_t, hh).real
-            y = y + torch.einsum("bthr,hrf->bthf", s_c * read, self.c_out)
-
-        return y.reshape(Bsz, T, Fdim) + x * self.D
+        h = _selective_recurrence(
+            torch.complex(lam_re, lam_im), torch.complex(Bu_re, Bu_im)
+        )
+        return self._post_scan(x, h.real, h.imag)
 
 
 def _selective_recurrence(lam: torch.Tensor, Bu: torch.Tensor) -> torch.Tensor:

@@ -24,6 +24,7 @@ from models.linoss.linoss import LinOSS
 from models.loss import phase_losses
 from models.s4d.s4d import S4DKernel
 from models.s5.s5 import S5SSM
+from models.selective_lru import SelectiveLRUMIMO
 from models.stfts import mag_phase_istft, mag_phase_stft
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
@@ -111,7 +112,9 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                 clean_audio[..., :min_len], audio_g[..., :min_len]
             )
 
-            # Log a handful of example utterances as waveforms / spectrograms
+            # Log a handful of example utterances as waveforms / spectrograms. The
+            # clean/noisy references are static across training, so only log them on
+            # the very first validation pass; later passes log only the enhanced output.
             if n_utts < num_viz_samples:
                 noisy_audio = mag_phase_istft(
                     noisy_mag, noisy_pha, n_fft, hop_size, win_size, compress_factor
@@ -130,6 +133,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                         clean_mag[i : i + 1],
                         noisy_mag[i : i + 1],
                         mag_g[i : i + 1],
+                        log_reference=not validate._reference_logged,
                         max_seconds=viz_max_seconds,
                     )
 
@@ -154,6 +158,7 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
                 utmos=val_metrics["UTMOS Score"] / max(n_utts, 1),
             )
     pbar.close()
+    validate._reference_logged = True
 
     n_total = max(n_utts, 1)
     averaged = {k: v / n_total for k, v in val_metrics.items()}
@@ -175,6 +180,11 @@ def validate(generator, evaluator, validation_loader, cfg, device, sw, steps, st
     print(log_str)
     model.train()
     return best_pesq, best_pesq_step, best_utmos, best_utmos_step
+
+
+# Tracks whether the static clean/noisy reference spectrograms have been logged yet;
+# they only need logging on the first validation pass (see the viz call above).
+validate._reference_logged = False
 
 
 def create_partitioned_optimizer(
@@ -207,6 +217,22 @@ def create_partitioned_optimizer(
             # weight decay. The C readout and the D skip (S4DCore.D) stay at the base LR.
             for attr in ["log_dt", "log_A_real", "A_imag"]:
                 param = getattr(module, attr, None)
+                if param is not None and param.requires_grad:
+                    ssm_params.append(param)
+                    ssm_param_ids.add(id(param))
+        elif isinstance(module, SelectiveLRUMIMO):
+            # Recurrence (pole) parameters get the reduced ssm_lr with no weight
+            # decay — the analog of LinOSS's A_diag/G_diag. Only the baseline-bank
+            # *biases* qualify (magnitude nu_proj.bias, and the phase baseline:
+            # theta_proj.bias in selective mode, or the learnable theta parameter);
+            # the selective *weight* matrices nu_proj.weight/theta_proj.weight stay
+            # at the base LR so they can learn the input-dependence fast enough.
+            recurrence_params = [module.nu_proj.bias]
+            if module.phase_mode == "selective":
+                recurrence_params.append(module.theta_proj.bias)
+            elif module.phase_mode == "learnable":
+                recurrence_params.append(module.theta)
+            for param in recurrence_params:
                 if param is not None and param.requires_grad:
                     ssm_params.append(param)
                     ssm_param_ids.add(id(param))
