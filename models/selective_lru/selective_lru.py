@@ -45,6 +45,30 @@ class SelectiveLRU(nn.Module):
         selective_init_std: Std of the low-rank selective projection weights at init.
             Small, so selectivity is learned as a perturbation off a working oscillator
             bank rather than from scratch. Default 1e-2.
+        input_norm: How the (real) input map ``Bu`` is scaled before the scan.
+            - ``"delta_nu"`` (default, current behavior): ``Bu = delta_nu * B_sel * x`` —
+              Mamba's ZOH-style input gain (small time-step -> small drive).
+            - ``"gamma"``: ``Bu = sqrt(1 - nu**2) * B_sel * x`` — the LRU
+              variance-preserving normalization (drive shrinks as the pole nears the unit
+              circle). The natural partner of ``mag_init="ring"``.
+            Only the input gain changes; the pole ``lam`` and the scan are untouched.
+        mag_init: Initialization of the baseline pole magnitude ``nu = exp(-delta_nu * a)``.
+            - ``"mamba"`` (default, current behavior): ``a = 1..d_state`` (S4D-real) with
+              baseline ``delta_nu = softplus(bias)`` drawn from ``[dt_min, dt_max]``
+              (Mamba's dt init), so baseline ``nu`` sits just inside the unit disk.
+            - ``"ring"``: baseline magnitudes drawn from the LRU ring ``[r_min, r_max]``,
+              realized within the same ``nu = exp(-delta_nu * a)`` parameterization by
+              fixing baseline ``delta_nu = 1`` and setting ``a = -log(nu_target)``.
+              ``dt_min``/``dt_max`` are ignored in this mode.
+        r_min: Lower bound of the ``mag_init="ring"`` pole-magnitude band. Default 0.9.
+        r_max: Upper bound of the ``mag_init="ring"`` pole-magnitude band. Default 0.999.
+        rank: Rank of an optional cross-channel readout correction added on top of the
+            (channel-diagonal) base readout. ``0`` (default) disables it entirely — no
+            extra parameters, forward identical to the base model. ``rank > 0`` adds a
+            low-rank input-dependent cross-channel coupling on the read side, initialized
+            to ~0 so training starts from the base model. Reference path only: ``rank > 0``
+            forces the materialized path even when ``use_triton`` is set. See
+            ``_rank_read``.
         use_triton: If True, run the fused ``mamboss6_triton`` kernel — which keeps the
             per-channel state off HBM (forward streams it in registers; backward recomputes
             it in chunks) — instead of the materialized Python reference path. Requires CUDA.
@@ -64,6 +88,11 @@ class SelectiveLRU(nn.Module):
         dt_max: float = 0.1,
         theta_max: float = math.pi,
         selective_init_std: float = 1e-2,
+        input_norm: str = "delta_nu",
+        mag_init: str = "mamba",
+        r_min: float = 0.9,
+        r_max: float = 0.999,
+        rank: int = 0,
         use_triton: bool = False,
         chunk_size: int = 16,
         block_c: int = 32,
@@ -72,8 +101,17 @@ class SelectiveLRU(nn.Module):
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        if input_norm not in ("delta_nu", "gamma"):
+            raise ValueError(f"input_norm={input_norm!r} must be 'delta_nu' or 'gamma'")
+        if mag_init not in ("mamba", "ring"):
+            raise ValueError(f"mag_init={mag_init!r} must be 'mamba' or 'ring'")
+        if rank < 0:
+            raise ValueError(f"rank={rank} must be >= 0")
         self.d_model = d_model
         self.d_state = d_state
+        self.input_norm = input_norm
+        self.mag_init = mag_init
+        self.rank = rank
         self.use_triton = use_triton
         self.chunk_size = chunk_size
         self.block_c = block_c
@@ -91,22 +129,46 @@ class SelectiveLRU(nn.Module):
         self.dt_theta_down = nn.Linear(d_model, dt_rank, bias=False)
         self.dt_theta_up = nn.Linear(dt_rank, d_model, bias=True)
 
+        # Optional rank-r cross-channel readout correction (skipped entirely when
+        # rank == 0, so the default is byte-identical to the base model). The base
+        # readout is channel-diagonal (channel c reads only its own bank); this adds a
+        # low-rank cross-channel coupling on the read side: pool the per-channel states
+        # into `rank` aggregate banks (c_pool), read each with an input-dependent complex
+        # vector (c_read) + scalar (c_coef), and scatter to output channels (c_out).
+        if rank > 0:
+            self.c_read = nn.Linear(d_model, 2 * rank * d_state, bias=False)
+            self.c_coef = nn.Linear(d_model, rank, bias=False)
+            self.c_pool = nn.Parameter(torch.empty(rank, d_model))
+            self.c_out = nn.Parameter(torch.empty(rank, d_model))
+
         # Per-channel static dynamics.
-        # - Decay rate a = exp(A_log) > 0 (init reproduces Mamba's S4D-real A = 1..state_dim)
+        # - Decay rate a = exp(A_log) > 0, baseline pole magnitude nu = exp(-delta_nu * a).
         # - Base frequency omega spread over the full angular range.
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_model, 1)
-        self.A_log = nn.Parameter(torch.log(A))
         self.omega = nn.Parameter(torch.rand(d_model, d_state) * theta_max)
+        if mag_init == "mamba":
+            # a = 1..state_dim (Mamba's S4D-real A).
+            A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_model, 1)
+            self.A_log = nn.Parameter(torch.log(A))
+        else:  # "ring": baseline nu drawn from the LRU ring; a = -log(nu_target) with
+            # baseline delta_nu = 1 (set below), so baseline nu = exp(-a) = nu_target.
+            mags = torch.sqrt(
+                torch.rand(d_model, d_state) * (r_max**2 - r_min**2) + r_min**2
+            )
+            self.A_log = nn.Parameter(torch.log(-torch.log(mags)))
 
         self.D = nn.Parameter(torch.randn(d_model))
 
         with torch.no_grad():
-            # Magnitude init: softplus(dt_nu_up.bias) uniform in [dt_min, dt_max]
-            # (like Mamba's dt init), so baseline nu = exp(-dt * a) lands near the unit disk.
-            dt = torch.exp(
-                torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            )
+            # Magnitude init via the baseline delta_nu = softplus(dt_nu_up.bias).
+            if mag_init == "mamba":
+                # softplus(bias) uniform in [dt_min, dt_max] (Mamba's dt init), so
+                # baseline nu = exp(-dt * a) lands near the unit disk.
+                dt = torch.exp(
+                    torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min))
+                    + math.log(dt_min)
+                )
+            else:  # "ring": baseline delta_nu = 1 so baseline nu = exp(-a) = nu_target.
+                dt = torch.ones(d_model)
             self.dt_nu_up.bias.copy_(_inv_softplus(dt))
 
             # Phase init: delta_theta = 0, so theta = omega at init (the full
@@ -116,6 +178,14 @@ class SelectiveLRU(nn.Module):
             # Selective weights start small (perturbation off a static oscillator bank).
             for proj in (self.dt_nu_down, self.dt_nu_up, self.dt_theta_down, self.dt_theta_up):
                 proj.weight.normal_(0.0, selective_init_std)
+
+            # Rank-r read correction: c_coef starts tiny so the scalar gate s^C ~ 0, i.e.
+            # the correction vanishes at init and the model begins as the base readout.
+            if rank > 0:
+                self.c_read.weight.normal_(0.0, 1.0 / math.sqrt(d_model))
+                self.c_coef.weight.normal_(0.0, selective_init_std / math.sqrt(d_model))
+                self.c_pool.normal_(0.0, 1.0 / math.sqrt(d_model))
+                self.c_out.copy_(_uniform_init((rank, d_model), std=1.0 / math.sqrt(d_model)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B_, T, C = x.shape
@@ -130,26 +200,63 @@ class SelectiveLRU(nn.Module):
         C_sel = self.C_proj(x)                                        # (B, T, 2N)
         C_complex = torch.complex(C_sel[..., :N], C_sel[..., N:])     # (B, T, N) shared
 
-        if self.use_triton:
-            # Fused scan + readout: the state never loads into HBM.
+        if self.use_triton and self.rank == 0:
+            # Fused scan + readout: the state never loads into HBM. (The rank-r read
+            # correction needs the full state, which the kernel does not return, so
+            # rank > 0 falls through to the materialized path below.)
             from models.selective_lru.selective_lru_triton import fused_selective_lru
             return fused_selective_lru(
                 delta_nu, delta_theta, a, self.omega, B_sel, C_complex, x, self.D,
                 block_t=self.chunk_size, block_c=self.block_c,
+                use_gamma=self.input_norm == "gamma",
             )
         else:  # Materialized path: per-channel complex selective scan.
             nu = torch.exp(-delta_nu.unsqueeze(-1) * a)                  # (B, T, C, N) in (0,1)
             theta = self.omega + delta_theta.unsqueeze(-1)               # (B, T, C, N)
             lam = torch.polar(nu, theta)                                 # (B, T, C, N) complex
 
-            Bu = (delta_nu.unsqueeze(-1) * B_sel.unsqueeze(-2)) * x.unsqueeze(-1)  # (B, T, C, N)
+            if self.input_norm == "gamma":
+                gain = torch.sqrt((1.0 - nu**2).clamp_min(1e-6))         # (B, T, C, N) LRU norm
+            else:
+                gain = delta_nu.unsqueeze(-1)                            # (B, T, C, 1) ZOH gain
+            Bu = (gain * B_sel.unsqueeze(-2)) * x.unsqueeze(-1)          # (B, T, C, N)
             Bu = Bu.to(lam.dtype)
 
             h = _selective_recurrence(lam.reshape(B_, T, C * N), Bu.reshape(B_, T, C * N))
             h = h.reshape(B_, T, C, N)
 
             Cy = torch.einsum("btn,btcn->btc", C_complex, h).real        # (B, T, C)
+            if self.rank > 0:
+                Cy = Cy + self._rank_read(x, h)
             return Cy + x * self.D
+
+    def _rank_read(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Rank-r cross-channel readout correction (reference path only).
+
+        The base readout is channel-diagonal — channel ``c`` reads only its own bank
+        ``h[:, :, c, :]`` with the shared ``C``. This adds a rank-r cross-channel
+        coupling: pool the per-channel states into ``rank`` aggregate banks with static
+        weights ``c_pool``, read each with an input-dependent complex vector ``c_t`` and
+        scalar gate ``s^C``, then scatter to the output channels via static directions
+        ``c_out``. The channel-mixing matrix ``sum_i c_out[i] c_pool[i]^T`` has rank
+        ``<= rank``. Because ``c_coef`` starts tiny, the correction is ~0 at init and is
+        causal (``h_t`` and ``c_t``/``s^C`` depend only on inputs up to ``t``).
+
+        Args:
+            x: Input ``(B, T, C)``.
+            h: Complex per-channel state ``(B, T, C, N)`` from the scan.
+
+        Returns:
+            Additive readout correction ``(B, T, C)``.
+        """
+        Bsz, T, _ = x.shape
+        r, N = self.rank, self.d_state
+        cr = self.c_read(x).view(Bsz, T, r, 2 * N)
+        c_t = torch.complex(cr[..., :N], cr[..., N:])                 # (B, T, r, N) read vecs
+        hbar = torch.einsum("rc,btcn->btrn", self.c_pool.to(h.dtype), h)  # (B, T, r, N) pooled
+        read = torch.einsum("btrn,btrn->btr", c_t, hbar).real        # (B, T, r)
+        s_c = self.c_coef(x)                                          # (B, T, r), ~0 at init
+        return torch.einsum("btr,rc->btc", s_c * read, self.c_out)   # (B, T, C)
 
 
 class SelectiveLRUMIMO(nn.Module):

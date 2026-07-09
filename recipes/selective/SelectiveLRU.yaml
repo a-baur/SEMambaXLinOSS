@@ -4,13 +4,17 @@ base: ../base.yaml
 model_cfg:
   use_phase_fan: false
   use_fan_denseblock: false
-  d_state: 8
+  d_state: 64
   d_conv: 4
-  expand: 4
+  expand: 2
   norm_epsilon: 1.0e-05
   causal_conv: true
   ssm: selective_lru
   ssm_params:
+    input_norm: gamma      # or delta_nu (default)
+    mag_init: ring         # or mamba (default)
+    r_min: 0.9
+    r_max: 0.999
     dt_rank: null
     dt_min: 0.001
     dt_max: 0.1
@@ -19,3 +23,4 @@ model_cfg:
     use_triton: true
     chunk_size: 16
     block_c: 32
+    rank: 0

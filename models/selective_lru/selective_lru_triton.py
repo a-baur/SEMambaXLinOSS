@@ -21,6 +21,7 @@ def _selective_lru_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
     SAVE_CKPT: tl.constexpr,
+    USE_GAMMA: tl.constexpr,
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -60,7 +61,11 @@ def _selective_lru_fwd_kernel(
         th = om + dth[:, None]
         lre = nu * tl.cos(th)
         lim = nu * tl.sin(th)
-        bu = dnu[:, None] * Bs[None, :] * xv[:, None]
+        if USE_GAMMA:
+            gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
+            bu = gain * Bs[None, :] * xv[:, None]
+        else:
+            bu = dnu[:, None] * Bs[None, :] * xv[:, None]
 
         new_hre = lre * hre - lim * him + bu
         new_him = lre * him + lim * hre
@@ -87,6 +92,7 @@ def _selective_lru_bwd_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_GAMMA: tl.constexpr,
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -139,7 +145,11 @@ def _selective_lru_bwd_kernel(
                 th = om + dth[:, None]
                 lre = nu * tl.cos(th)
                 lim = nu * tl.sin(th)
-                bu = dnu[:, None] * Bs[None, :] * xv[:, None]
+                if USE_GAMMA:
+                    gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
+                    bu = gain * Bs[None, :] * xv[:, None]
+                else:
+                    bu = dnu[:, None] * Bs[None, :] * xv[:, None]
                 n_re = lre * bre - lim * bim + bu
                 n_im = lre * bim + lim * bre
                 bre = n_re
@@ -182,12 +192,23 @@ def _selective_lru_bwd_kernel(
                 Gtr = gre + lnr * Gre + lni * Gim
                 Gti = gim + lnr * Gim - lni * Gre
 
-                # dBu = Re(G_t); Bu = dnu * Bsel * x.  dBsel reduces over channels (atomic).
+                # dBu = Re(G_t); Bu = gain * Bsel * x.  dBsel reduces over channels (atomic).
                 gbu = Gtr
-                dBs_c = tl.sum(tl.where(m2, gbu * dnu[:, None] * xv[:, None], 0.0), axis=0)
+                if USE_GAMMA:
+                    # gain = sqrt(1 - nu^2); d gain / d nu = -nu / gain, so the input map
+                    # feeds gradient into nu = exp(-dnu*a) (hence dnu and a) too.
+                    gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
+                    dBs_c = tl.sum(tl.where(m2, gbu * gain * xv[:, None], 0.0), axis=0)
+                    dx_bu = tl.sum(tl.where(m2, gbu * gain * Bs[None, :], 0.0), axis=1)
+                    dnu_bu = (gbu * Bs[None, :] * xv[:, None]) * (-nu / gain)
+                    d_dnu_bu = tl.sum(tl.where(m2, dnu_bu * (-a) * nu, 0.0), axis=1)
+                    da_bu = dnu_bu * (-dnu[:, None]) * nu
+                else:
+                    dBs_c = tl.sum(tl.where(m2, gbu * dnu[:, None] * xv[:, None], 0.0), axis=0)
+                    d_dnu_bu = tl.sum(tl.where(m2, gbu * Bs[None, :] * xv[:, None], 0.0), axis=1)
+                    dx_bu = tl.sum(tl.where(m2, gbu * dnu[:, None] * Bs[None, :], 0.0), axis=1)
+                    da_bu = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
                 tl.atomic_add(dBs_ptr + n_off, dBs_c, mask=mn)
-                d_dnu_bu = tl.sum(tl.where(m2, gbu * Bs[None, :] * xv[:, None], 0.0), axis=1)
-                dx_bu = tl.sum(tl.where(m2, gbu * dnu[:, None] * Bs[None, :], 0.0), axis=1)
 
                 # dlam = G_t conj(h_{t-1}); split into nu/theta grads.
                 dlre = Gtr * hm_re + Gti * hm_im
@@ -196,7 +217,7 @@ def _selective_lru_bwd_kernel(
                 dth_n = nu * (dlim * costh - dlre * sinth)
                 d_dnu_lam = tl.sum(tl.where(m2, dnu_n * (-a) * nu, 0.0), axis=1)
                 d_dth = tl.sum(tl.where(m2, dth_n, 0.0), axis=1)
-                da_acc += dnu_n * (-dnu[:, None]) * nu
+                da_acc += dnu_n * (-dnu[:, None]) * nu + da_bu
                 dom_acc += dth_n
 
                 # Readout grads at t (need h_t): dC reduces over channels (atomic).
@@ -222,7 +243,8 @@ def _selective_lru_bwd_kernel(
 
 class _SelectiveLRUScan(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, delta_nu, delta_theta, a, omega, Bsel, Cre, Cim, x, D, block_t, block_c):
+    def forward(ctx, delta_nu, delta_theta, a, omega, Bsel, Cre, Cim, x, D,
+                block_t, block_c, use_gamma):
         if not delta_nu.is_cuda:
             raise RuntimeError("fused MambOSS6 scan requires CUDA tensors.")
         B, T, C = delta_nu.shape
@@ -258,12 +280,14 @@ class _SelectiveLRUScan(torch.autograd.Function):
             dnu, dth, x, a, omega, D, Bsel, Cre, Cim, y, ckpt_re, ckpt_im,
             B, T, C, N, NC,
             BLOCK_C=BLOCK_C, BLOCK_N=BLOCK_N, BLOCK_T=block_t, SAVE_CKPT=save,
+            USE_GAMMA=use_gamma,
         )
 
         if save:
             ctx.save_for_backward(dnu, dth, a, omega, Bsel, Cre, Cim, x, D, ckpt_re, ckpt_im)
             ctx.shapes = (B, T, C, N, NC)
             ctx.blocks = (block_t, BLOCK_C, BLOCK_N)
+            ctx.use_gamma = use_gamma
         return y
 
     @staticmethod
@@ -293,9 +317,10 @@ class _SelectiveLRUScan(torch.autograd.Function):
             d_dnu, d_dth, dx, da, dom, dD, dBs, dCre, dCim,
             B, T, C, N, NC,
             BLOCK_C=BLOCK_C, BLOCK_N=BLOCK_N, BLOCK_T=BLOCK_T,
+            USE_GAMMA=ctx.use_gamma,
         )
 
-        return d_dnu, d_dth, da, dom, dBs, dCre, dCim, dx, dD, None, None
+        return d_dnu, d_dth, da, dom, dBs, dCre, dCim, dx, dD, None, None, None
 
 
 def fused_selective_lru(
@@ -309,14 +334,17 @@ def fused_selective_lru(
     D: torch.Tensor,
     block_t: int = 16,
     block_c: int = 32,
+    use_gamma: bool = False,
 ) -> torch.Tensor:
     """Fused selective LRU scan + readout. Returns ``y`` of shape ``(B, T, C)``.
 
     block_t is the backward chunk width (peak extra HBM scales with it);
     block_c is the per-program channel-slab width  (throughput knob, bigger shares more B/C loads and shrinks atomic traffic).
+    use_gamma selects the input gain: False -> ``Bu = delta_nu * Bsel * x`` (Mamba ZOH),
+    True -> ``Bu = sqrt(1 - nu**2) * Bsel * x`` (LRU variance-preserving normalization).
     """
     return _SelectiveLRUScan.apply(
         delta_nu, delta_theta, a, omega, Bsel,
         C_complex.real.contiguous(), C_complex.imag.contiguous(),
-        x, D, block_t, block_c,
+        x, D, block_t, block_c, use_gamma,
     )
