@@ -8,6 +8,11 @@
       <sourceFolder url="file://$MODULE_DIR$/mamba_install" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/mamba_install/build/lib.linux-x86_64-cpython-312" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/ckpts" />
+      <excludeFolder url="file://$MODULE_DIR$/eval_out" />
+      <excludeFolder url="file://$MODULE_DIR$/exp" />
+      <excludeFolder url="file://$MODULE_DIR$/exp_ears_archive" />
+      <excludeFolder url="file://$MODULE_DIR$/exp_vb_dmd" />
     </content>
     <orderEntry type="jdk" jdkName="uv (SEMambaXLinOSS)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

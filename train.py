@@ -376,6 +376,95 @@ def create_dataloader(dataset, cfg, train=True):
     )
 
 
+def capture_git_state():
+    """Capture the current git commit + working-tree diff for run provenance.
+
+    Returns a dict with the commit hash, a dirty flag, the full uncommitted diff
+    of tracked files (staged + unstaged, relative to HEAD), and the list of
+    untracked-file paths, so any wandb run can be reproduced by checking out the
+    commit and re-applying the diff. Untracked *contents* are deliberately not
+    diffed -- this repo leaves large dataset/checkpoint dirs untracked, and
+    reading them would be slow and useless for code rollback. Every field
+    degrades gracefully if git is unavailable or this is not a repo, so training
+    never fails on account of provenance capture.
+    """
+    import subprocess
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+
+    def _git(*args):
+        try:
+            return subprocess.run(
+                ["git", "-C", repo_root, *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return None
+
+    commit = _git("rev-parse", "HEAD")
+    if commit is None:
+        return {"commit": None, "dirty": False, "diff": "", "untracked": []}
+
+    # Tracked changes (staged + unstaged) relative to HEAD.
+    diff = _git("diff", "HEAD") or ""
+    # Record untracked file *names* only (not contents) for reference.
+    untracked = _git("ls-files", "--others", "--exclude-standard") or ""
+    untracked_files = untracked.splitlines()
+
+    return {
+        "commit": commit,
+        "dirty": bool(diff.strip()),
+        "diff": diff,
+        "untracked": untracked_files,
+    }
+
+
+def log_git_state(exp_path):
+    """Record git provenance on the active wandb run.
+
+    Writes the commit hash and dirty flag to ``wandb.config``/``summary`` (so they
+    show up as sortable columns) and saves the full diff both as a run artifact
+    file (``git_diff.patch``) and as a logged text file under ``exp_path``.
+    """
+    state = capture_git_state()
+    if state["commit"] is None:
+        print("Not a git repo (or git unavailable); skipping git provenance logging.")
+        return
+
+    wandb.config.update(
+        {
+            "git_commit": state["commit"],
+            "git_dirty": state["dirty"],
+            "git_untracked_count": len(state["untracked"]),
+        },
+        allow_val_change=True,
+    )
+    wandb.run.summary["git_commit"] = state["commit"]
+    wandb.run.summary["git_dirty"] = state["dirty"]
+
+    # Save the full diff so a run can be reconstructed as
+    # `git checkout <commit> && git apply git_diff.patch`. Prepend a header
+    # noting untracked files (names only, capped -- this repo leaves tens of
+    # thousands of dataset files untracked, so we don't dump them all).
+    patch_path = os.path.join(exp_path, "git_diff.patch")
+    header = f"# git_commit: {state['commit']}\n"
+    n_untracked = len(state["untracked"])
+    if n_untracked:
+        header += f"# untracked files ({n_untracked} total, contents not captured):\n"
+        cap = 50
+        header += "".join(f"#   {p}\n" for p in state["untracked"][:cap])
+        if n_untracked > cap:
+            header += f"#   ... and {n_untracked - cap} more\n"
+    with open(patch_path, "w") as f:
+        f.write(header + state["diff"])
+    wandb.save(patch_path, base_path=exp_path)
+
+    status = "dirty" if state["dirty"] else "clean"
+    print(f"Logged git provenance: commit {state['commit'][:12]} ({status}).")
+
+
 def find_wandb_run_id(exp_path):
     """Return the id of the most recent wandb run stored under ``exp_path``.
 
@@ -466,6 +555,7 @@ def train(rank, args, cfg):
             id=resume_id,
             resume="allow",
         )
+        log_git_state(args.exp_path)
         sw = SummaryWriter(os.path.join(args.exp_path, "logs"))
 
     generator.train()

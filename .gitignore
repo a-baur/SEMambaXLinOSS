@@ -2,3 +2,8 @@
 __pycache__
 .venv
 uv.lock
+/exp/
+/exp_ears_archive/
+/exp_vb_dmd/
+/eval_out/
+/ckpts/
