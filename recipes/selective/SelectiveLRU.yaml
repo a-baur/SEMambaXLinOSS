@@ -5,7 +5,7 @@ model_cfg:
   # Set to the latent bin count F' AFTER the dense encoder -- for n_fft=400
   # (201 bins) with the stride-2 freq downsample this is 101; verify against
   # x.shape[-1] entering the first TFMambaBlock.
-  # freq_emb_bins: 100
+  freq_emb_bins: 100
 
   time_mixer:
     d_state: 32
@@ -33,7 +33,7 @@ model_cfg:
       block_c: 16
 
   freq_mixer:
-    d_state: 16
+    d_state: 8
     d_conv: 4
     expand: 3
     norm_epsilon: 1.0e-05
