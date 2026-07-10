@@ -8,9 +8,9 @@ model_cfg:
   # freq_emb_bins: 100
 
   time_mixer:
-    d_state: 8
+    d_state: 32
     d_conv: 4
-    expand: 4
+    expand: 3
     norm_epsilon: 1.0e-05
     causal_conv: true
     # bidirectional: false        # uncomment for the streamable variant
@@ -27,28 +27,27 @@ model_cfg:
       theta_max: 0.8
       # Real poles (theta = 0):
       # pure decays for envelope / stationary noise floor. 8 of 64 modes.
-      n_real_modes: 1
+      n_real_modes: 8
       use_triton: true
       chunk_size: 16
-      block_c: 32
+      block_c: 16
 
   freq_mixer:
-    d_state: 8
+    d_state: 16
     d_conv: 4
-    expand: 4
+    expand: 3
     norm_epsilon: 1.0e-05
     causal_conv: true
     ssm: selective_lru
     ssm_params:
-      dt_rank: 2
-      # Shorter memory band: ~3..200 bins instead of up to 1000 (10x the
-      # sequence). Formant-scale structure spans ~1 bin; tilt spans the axis.
+      dt_rank: 4
+      # Shorter memory band: ~3..200 bins
       dt_min: 0.005
       dt_max: 0.3
       # Full range: bin-axis periodicity (harmonic combs of low-pitch voices
       # sit near ~2.5 rad at this resolution) down to smooth envelopes.
       theta_max: 3.141592653589793
-      n_real_modes: 1
+      n_real_modes: 4
       use_triton: true
       chunk_size: 16
       block_c: 32
