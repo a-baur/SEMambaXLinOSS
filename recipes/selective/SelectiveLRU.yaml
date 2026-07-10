@@ -1,26 +1,54 @@
-# SelectiveLRU -- inherits shared config from base.yaml; only the mixer block differs.
 base: ../base.yaml
 
 model_cfg:
-  use_phase_fan: false
-  use_fan_denseblock: false
-  d_state: 64
-  d_conv: 4
-  expand: 2
-  norm_epsilon: 1.0e-05
-  causal_conv: true
-  ssm: selective_lru
-  ssm_params:
-    input_norm: gamma      # or delta_nu (default)
-    mag_init: ring         # or mamba (default)
-    r_min: 0.9
-    r_max: 0.999
-    dt_rank: null
-    dt_min: 0.001
-    dt_max: 0.1
-    theta_max: 3.141592653589793
-    init_std: 0.01
-    use_triton: true
-    chunk_size: 16
-    block_c: 32
-    rank: 0
+  # Per-bin identity for the time branch (zero-init, no-op at start).
+  # Set to the latent bin count F' AFTER the dense encoder -- for n_fft=400
+  # (201 bins) with the stride-2 freq downsample this is 101; verify against
+  # x.shape[-1] entering the first TFMambaBlock.
+  # freq_emb_bins: 100
+
+  time_mixer:
+    d_state: 8
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    # bidirectional: false        # uncomment for the streamable variant
+    ssm: selective_lru
+    ssm_params:
+      # Mamba's rank heuristic is ceil(hid_feature/16); the module default
+      # (ceil(d_model/64)) assumes expand=4, so at expand=2 set it explicitly.
+      dt_rank: 2
+      # Memory band 1/(dt*a): ~10..1000 frames (62 ms .. 6 s at 160 fps).
+      dt_min: 0.001
+      dt_max: 0.1
+      # Oscillators tile the speech modulation band:
+      # theta_max = 0.8 rad/frame = 0.8 * 160 / 2pi ~= 20 Hz.
+      theta_max: 0.8
+      # Real poles (theta = 0):
+      # pure decays for envelope / stationary noise floor. 8 of 64 modes.
+      n_real_modes: 1
+      use_triton: true
+      chunk_size: 16
+      block_c: 32
+
+  freq_mixer:
+    d_state: 8
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    ssm: selective_lru
+    ssm_params:
+      dt_rank: 2
+      # Shorter memory band: ~3..200 bins instead of up to 1000 (10x the
+      # sequence). Formant-scale structure spans ~1 bin; tilt spans the axis.
+      dt_min: 0.005
+      dt_max: 0.3
+      # Full range: bin-axis periodicity (harmonic combs of low-pitch voices
+      # sit near ~2.5 rad at this resolution) down to smooth envelopes.
+      theta_max: 3.141592653589793
+      n_real_modes: 1
+      use_triton: true
+      chunk_size: 16
+      block_c: 32

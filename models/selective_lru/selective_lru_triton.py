@@ -9,11 +9,20 @@ def _block_n(n: int) -> int:
     return max(16, triton.next_power_of_2(n))
 
 
+_FWD_CONFIGS = [
+    triton.Config({"BLOCK_C": bc}, num_warps=w)
+    for bc in (16, 32, 64)
+    for w in (2, 4, 8)
+]
+
+
+@triton.autotune(configs=_FWD_CONFIGS, key=["T", "C", "N"])
 @triton.jit
 def _selective_lru_fwd_kernel(
     dnu_ptr, dth_ptr, x_ptr,          # (B, T, C)
     a_ptr, om_ptr, D_ptr,             # (C, N), (C, N), (C,)
-    Bs_ptr, Cre_ptr, Cim_ptr,         # (B, T, N)
+    Bsr_ptr, Bsi_ptr,                 # (B, T, N)
+    Cre_ptr, Cim_ptr,                 # (B, T, N)
     y_ptr,                            # (B, T, C)
     ckpt_re_ptr, ckpt_im_ptr,         # (B, NC, C, N)
     B, T, C, N, NC,
@@ -21,7 +30,6 @@ def _selective_lru_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
     SAVE_CKPT: tl.constexpr,
-    USE_GAMMA: tl.constexpr,
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -32,10 +40,13 @@ def _selective_lru_fwd_kernel(
     mn = on < N
     m2 = mc[:, None] & mn[None, :]
 
-    cn = oc[:, None] * N + on[None, :]               # (BLOCK_C, BLOCK_N) index into (C, N)
+    cn = oc[:, None] * N + on[None, :]               # index into (C, N)
     a = tl.load(a_ptr + cn, mask=m2, other=0.0)
     om = tl.load(om_ptr + cn, mask=m2, other=0.0)
     Dc = tl.load(D_ptr + oc, mask=mc, other=0.0)
+
+    c_base = pb * T * C + oc
+    n_base = pb * T * N + on
 
     hre = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
     him = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
@@ -48,27 +59,25 @@ def _selective_lru_fwd_kernel(
                 tl.store(ckpt_re_ptr + ck, hre, mask=m2)
                 tl.store(ckpt_im_ptr + ck, him, mask=m2)
 
-        c_off = pb * T * C + t * C + oc
-        n_off = pb * T * N + t * N + on
+        c_off = c_base + t * C
+        n_off = n_base + t * N
         dnu = tl.load(dnu_ptr + c_off, mask=mc, other=0.0)
         dth = tl.load(dth_ptr + c_off, mask=mc, other=0.0)
         xv = tl.load(x_ptr + c_off, mask=mc, other=0.0)
-        Bs = tl.load(Bs_ptr + n_off, mask=mn, other=0.0)
+        Bsr = tl.load(Bsr_ptr + n_off, mask=mn, other=0.0)
+        Bsi = tl.load(Bsi_ptr + n_off, mask=mn, other=0.0)
         Cr = tl.load(Cre_ptr + n_off, mask=mn, other=0.0)
         Ci = tl.load(Cim_ptr + n_off, mask=mn, other=0.0)
 
+        # lam = exp(dnu * (-a + j(om + dth)));  Bu = sqrt(1 - |lam|^2) * (Bsr + jBsi) * x
         nu = tl.exp(-dnu[:, None] * a)
-        th = om + dth[:, None]
+        th = dnu[:, None] * (om + dth[:, None])
         lre = nu * tl.cos(th)
         lim = nu * tl.sin(th)
-        if USE_GAMMA:
-            gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
-            bu = gain * Bs[None, :] * xv[:, None]
-        else:
-            bu = dnu[:, None] * Bs[None, :] * xv[:, None]
+        gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
 
-        new_hre = lre * hre - lim * him + bu
-        new_him = lre * him + lim * hre
+        new_hre = lre * hre - lim * him + gx * Bsr[None, :]
+        new_him = lre * him + lim * hre + gx * Bsi[None, :]
         hre = new_hre
         him = new_him
 
@@ -80,19 +89,19 @@ def _selective_lru_fwd_kernel(
 @triton.jit
 def _selective_lru_bwd_kernel(
     dnu_ptr, dth_ptr, x_ptr,          # (B, T, C)
-    a_ptr, om_ptr, D_ptr,     # (C, N), (C, N), (C,)
-    Bs_ptr, Cre_ptr, Cim_ptr,         # (B, T, N)
-    dy_ptr,                                                 # (B, T, C)  upstream grad
-    ckpt_re_ptr, ckpt_im_ptr,           # (B, NC, C, N)  chunk-boundary states (from forward)
-    ht_re_ptr, ht_im_ptr,                                   # (B, C, BLOCK_T, N)  within-chunk state scratch
-    d_dnu_ptr, d_dth_ptr, dx_ptr,                           # (B, T, C)  per-element grads (direct write)
-    da_ptr, dom_ptr, dD_ptr,                          # (C, N), (C, N), (C,)  batch-reduced grads (atomic)
-    dBs_ptr, dCre_ptr, dCim_ptr,                            # (B, T, N)  channel-reduced grads (atomic)
+    a_ptr, om_ptr, D_ptr,             # (C, N), (C, N), (C,)
+    Bsr_ptr, Bsi_ptr,                 # (B, T, N)
+    Cre_ptr, Cim_ptr,                 # (B, T, N)
+    dy_ptr,                           # (B, T, C)  upstream grad
+    ckpt_re_ptr, ckpt_im_ptr,         # (B, NC, C, N)  chunk-boundary states (from forward)
+    ht_re_ptr, ht_im_ptr,             # (B, C, BLOCK_T, N)  within-chunk state scratch
+    d_dnu_ptr, d_dth_ptr, dx_ptr,     # (B, T, C)  per-element grads (direct write)
+    da_ptr, dom_ptr, dD_ptr,          # (C, N), (C, N), (C,)  batch-reduced grads (atomic)
+    dBsr_ptr, dBsi_ptr, dCre_ptr, dCim_ptr,   # (B, T, N)  channel-reduced grads (atomic)
     B, T, C, N, NC,
     BLOCK_C: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    USE_GAMMA: tl.constexpr,
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -140,18 +149,15 @@ def _selective_lru_bwd_kernel(
                 dnu = tl.load(dnu_ptr + c_off, mask=mc, other=0.0)
                 dth = tl.load(dth_ptr + c_off, mask=mc, other=0.0)
                 xv = tl.load(x_ptr + c_off, mask=mc, other=0.0)
-                Bs = tl.load(Bs_ptr + n_off, mask=mn, other=0.0)
+                Bsr = tl.load(Bsr_ptr + n_off, mask=mn, other=0.0)
+                Bsi = tl.load(Bsi_ptr + n_off, mask=mn, other=0.0)
                 nu = tl.exp(-dnu[:, None] * a)
-                th = om + dth[:, None]
+                th = dnu[:, None] * (om + dth[:, None])
                 lre = nu * tl.cos(th)
                 lim = nu * tl.sin(th)
-                if USE_GAMMA:
-                    gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
-                    bu = gain * Bs[None, :] * xv[:, None]
-                else:
-                    bu = dnu[:, None] * Bs[None, :] * xv[:, None]
-                n_re = lre * bre - lim * bim + bu
-                n_im = lre * bim + lim * bre
+                gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
+                n_re = lre * bre - lim * bim + gx * Bsr[None, :]
+                n_im = lre * bim + lim * bre + gx * Bsi[None, :]
                 bre = n_re
                 bim = n_im
                 tl.store(ht_re_ptr + ht_cbase + li * N, bre, mask=m2)
@@ -167,7 +173,8 @@ def _selective_lru_bwd_kernel(
                 dnu = tl.load(dnu_ptr + c_off, mask=mc, other=0.0)
                 dth = tl.load(dth_ptr + c_off, mask=mc, other=0.0)
                 xv = tl.load(x_ptr + c_off, mask=mc, other=0.0)
-                Bs = tl.load(Bs_ptr + n_off, mask=mn, other=0.0)
+                Bsr = tl.load(Bsr_ptr + n_off, mask=mn, other=0.0)
+                Bsi = tl.load(Bsi_ptr + n_off, mask=mn, other=0.0)
                 Cr = tl.load(Cre_ptr + n_off, mask=mn, other=0.0)
                 Ci = tl.load(Cim_ptr + n_off, mask=mn, other=0.0)
                 dyv = tl.load(dy_ptr + c_off, mask=mc, other=0.0)
@@ -182,9 +189,11 @@ def _selective_lru_bwd_kernel(
                     hm_im = bnd_im
 
                 nu = tl.exp(-dnu[:, None] * a)
-                th = om + dth[:, None]
+                base = om + dth[:, None]
+                th = dnu[:, None] * base
                 costh = tl.cos(th)
                 sinth = tl.sin(th)
+                gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
 
                 # g_t = dy * conj(C); G_t = g_t + conj(lambda_{t+1}) G_{t+1}.
                 gre = dyv[:, None] * Cr[None, :]
@@ -192,33 +201,29 @@ def _selective_lru_bwd_kernel(
                 Gtr = gre + lnr * Gre + lni * Gim
                 Gti = gim + lnr * Gim - lni * Gre
 
-                # dBu = Re(G_t); Bu = gain * Bsel * x.  dBsel reduces over channels (atomic).
-                gbu = Gtr
-                if USE_GAMMA:
-                    # gain = sqrt(1 - nu^2); d gain / d nu = -nu / gain, so the input map
-                    # feeds gradient into nu = exp(-dnu*a) (hence dnu and a) too.
-                    gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
-                    dBs_c = tl.sum(tl.where(m2, gbu * gain * xv[:, None], 0.0), axis=0)
-                    dx_bu = tl.sum(tl.where(m2, gbu * gain * Bs[None, :], 0.0), axis=1)
-                    dnu_bu = (gbu * Bs[None, :] * xv[:, None]) * (-nu / gain)
-                    d_dnu_bu = tl.sum(tl.where(m2, dnu_bu * (-a) * nu, 0.0), axis=1)
-                    da_bu = dnu_bu * (-dnu[:, None]) * nu
-                else:
-                    dBs_c = tl.sum(tl.where(m2, gbu * dnu[:, None] * xv[:, None], 0.0), axis=0)
-                    d_dnu_bu = tl.sum(tl.where(m2, gbu * Bs[None, :] * xv[:, None], 0.0), axis=1)
-                    dx_bu = tl.sum(tl.where(m2, gbu * dnu[:, None] * Bs[None, :], 0.0), axis=1)
-                    da_bu = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
-                tl.atomic_add(dBs_ptr + n_off, dBs_c, mask=mn)
+                # Input map Bu = gain * (Bsr + jBsi) * x;  dBu = G_t (complex).
+                s = Gtr * Bsr[None, :] + Gti * Bsi[None, :]
+                dBsr_c = tl.sum(tl.where(m2, Gtr * gain * xv[:, None], 0.0), axis=0)
+                dBsi_c = tl.sum(tl.where(m2, Gti * gain * xv[:, None], 0.0), axis=0)
+                tl.atomic_add(dBsr_ptr + n_off, dBsr_c, mask=mn)
+                tl.atomic_add(dBsi_ptr + n_off, dBsi_c, mask=mn)
+                dx_bu = tl.sum(tl.where(m2, s * gain, 0.0), axis=1)
+                # gain = sqrt(1 - nu^2): the input map feeds gradient into nu too.
+                dnu_bu = (s * xv[:, None]) * (-nu / gain)
+                d_dnu_bu = tl.sum(tl.where(m2, dnu_bu * (-a) * nu, 0.0), axis=1)
+                da_bu = dnu_bu * (-dnu[:, None]) * nu
 
-                # dlam = G_t conj(h_{t-1}); split into nu/theta grads.
+                # dlam = G_t conj(h_{t-1}); nu and theta = dnu * (om + dth) chains.
                 dlre = Gtr * hm_re + Gti * hm_im
                 dlim = Gti * hm_re - Gtr * hm_im
                 dnu_n = dlre * costh + dlim * sinth
                 dth_n = nu * (dlim * costh - dlre * sinth)
-                d_dnu_lam = tl.sum(tl.where(m2, dnu_n * (-a) * nu, 0.0), axis=1)
-                d_dth = tl.sum(tl.where(m2, dth_n, 0.0), axis=1)
+                d_dnu_lam = tl.sum(
+                    tl.where(m2, dnu_n * (-a) * nu + dth_n * base, 0.0), axis=1
+                )
+                d_dth = tl.sum(tl.where(m2, dth_n * dnu[:, None], 0.0), axis=1)
+                dom_acc += dth_n * dnu[:, None]
                 da_acc += dnu_n * (-dnu[:, None]) * nu + da_bu
-                dom_acc += dth_n
 
                 # Readout grads at t (need h_t): dC reduces over channels (atomic).
                 dCr_c = tl.sum(tl.where(m2, dyv[:, None] * ht_re, 0.0), axis=0)
@@ -243,10 +248,10 @@ def _selective_lru_bwd_kernel(
 
 class _SelectiveLRUScan(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, delta_nu, delta_theta, a, omega, Bsel, Cre, Cim, x, D,
-                block_t, block_c, use_gamma):
+    def forward(ctx, delta_nu, delta_theta, a, omega, Bsr, Bsi, Cre, Cim, x, D,
+                block_t, block_c):
         if not delta_nu.is_cuda:
-            raise RuntimeError("fused MambOSS6 scan requires CUDA tensors.")
+            raise RuntimeError("fused selective-LRU scan requires CUDA tensors.")
         B, T, C = delta_nu.shape
         N = a.shape[1]
 
@@ -254,16 +259,14 @@ class _SelectiveLRUScan(torch.autograd.Function):
         dth = delta_theta.contiguous()
         a = a.contiguous()
         omega = omega.contiguous()
-        Bsel = Bsel.contiguous()
+        Bsr = Bsr.contiguous()
+        Bsi = Bsi.contiguous()
         Cre = Cre.contiguous()
         Cim = Cim.contiguous()
         x = x.contiguous()
         D = D.contiguous()
 
-        BLOCK_N = _block_n(N)
-        BLOCK_C = min(block_c, triton.next_power_of_2(C))
         NC = triton.cdiv(T, block_t)
-        grid = (B, triton.cdiv(C, BLOCK_C))
 
         y = torch.empty((B, T, C), device=dnu.device, dtype=torch.float32)
         # Grad mode is disabled inside Function.forward, so query ctx.needs_input_grad
@@ -276,25 +279,27 @@ class _SelectiveLRUScan(torch.autograd.Function):
             ckpt_re = dnu.new_empty(1)
             ckpt_im = dnu.new_empty(1)
 
+        grid = lambda META: (B, triton.cdiv(C, META["BLOCK_C"]))
         _selective_lru_fwd_kernel[grid](
-            dnu, dth, x, a, omega, D, Bsel, Cre, Cim, y, ckpt_re, ckpt_im,
+            dnu, dth, x, a, omega, D, Bsr, Bsi, Cre, Cim, y, ckpt_re, ckpt_im,
             B, T, C, N, NC,
-            BLOCK_C=BLOCK_C, BLOCK_N=BLOCK_N, BLOCK_T=block_t, SAVE_CKPT=save,
-            USE_GAMMA=use_gamma,
+            BLOCK_N=_block_n(N), BLOCK_T=block_t, SAVE_CKPT=save,
         )
 
         if save:
-            ctx.save_for_backward(dnu, dth, a, omega, Bsel, Cre, Cim, x, D, ckpt_re, ckpt_im)
+            ctx.save_for_backward(dnu, dth, a, omega, Bsr, Bsi, Cre, Cim, x, D,
+                                  ckpt_re, ckpt_im)
             ctx.shapes = (B, T, C, N, NC)
-            ctx.blocks = (block_t, BLOCK_C, BLOCK_N)
-            ctx.use_gamma = use_gamma
+            ctx.block_t = block_t
+            ctx.block_c = block_c
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        dnu, dth, a, omega, Bsel, Cre, Cim, x, D, ckpt_re, ckpt_im = ctx.saved_tensors
+        dnu, dth, a, omega, Bsr, Bsi, Cre, Cim, x, D, ckpt_re, ckpt_im = ctx.saved_tensors
         B, T, C, N, NC = ctx.shapes
-        BLOCK_T, BLOCK_C, BLOCK_N = ctx.blocks
+        BLOCK_T = ctx.block_t
+        BLOCK_C = min(ctx.block_c, triton.next_power_of_2(C))
         dev = dnu.device
         grid = (B, triton.cdiv(C, BLOCK_C))
 
@@ -307,20 +312,21 @@ class _SelectiveLRUScan(torch.autograd.Function):
         da = torch.zeros((C, N), device=dev, dtype=torch.float32)
         dom = torch.zeros((C, N), device=dev, dtype=torch.float32)
         dD = torch.zeros((C,), device=dev, dtype=torch.float32)
-        dBs = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
+        dBsr = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
+        dBsi = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
         dCre = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
         dCim = torch.zeros((B, T, N), device=dev, dtype=torch.float32)
 
         _selective_lru_bwd_kernel[grid](
-            dnu, dth, x, a, omega, D, Bsel, Cre, Cim, dy.contiguous(),
+            dnu, dth, x, a, omega, D, Bsr, Bsi, Cre, Cim, dy.contiguous(),
             ckpt_re, ckpt_im, ht_re, ht_im,
-            d_dnu, d_dth, dx, da, dom, dD, dBs, dCre, dCim,
+            d_dnu, d_dth, dx, da, dom, dD, dBsr, dBsi, dCre, dCim,
             B, T, C, N, NC,
-            BLOCK_C=BLOCK_C, BLOCK_N=BLOCK_N, BLOCK_T=BLOCK_T,
-            USE_GAMMA=ctx.use_gamma,
+            BLOCK_C=BLOCK_C, BLOCK_N=_block_n(N), BLOCK_T=BLOCK_T,
+            num_warps=4,
         )
 
-        return d_dnu, d_dth, da, dom, dBs, dCre, dCim, dx, dD, None, None, None
+        return (d_dnu, d_dth, da, dom, dBsr, dBsi, dCre, dCim, dx, dD, None, None)
 
 
 def fused_selective_lru(
@@ -328,23 +334,29 @@ def fused_selective_lru(
     delta_theta: torch.Tensor,
     a: torch.Tensor,
     omega: torch.Tensor,
-    Bsel: torch.Tensor,
-    C_complex: torch.Tensor,
+    Bsel_re: torch.Tensor,
+    Bsel_im: torch.Tensor,
+    Csel_re: torch.Tensor,
+    Csel_im: torch.Tensor,
     x: torch.Tensor,
     D: torch.Tensor,
     block_t: int = 16,
     block_c: int = 32,
-    use_gamma: bool = False,
 ) -> torch.Tensor:
-    """Fused selective LRU scan + readout. Returns ``y`` of shape ``(B, T, C)``.
+    """Fused selective-LRU scan + readout. Returns ``y`` of shape ``(B, T, C)``.
 
-    block_t is the backward chunk width (peak extra HBM scales with it);
-    block_c is the per-program channel-slab width  (throughput knob, bigger shares more B/C loads and shrinks atomic traffic).
-    use_gamma selects the input gain: False -> ``Bu = delta_nu * Bsel * x`` (Mamba ZOH),
-    True -> ``Bu = sqrt(1 - nu**2) * Bsel * x`` (LRU variance-preserving normalization).
+    Computes, per channel/mode:
+        lam = exp(delta_nu * (-a + j*(omega + delta_theta)))
+        Bu  = sqrt(1 - |lam|^2) * (Bsel_re + j*Bsel_im) * x
+        h_t = lam_t * h_{t-1} + Bu_t;   y = Re(<C, h>) + D * x
+
+    The forward kernel autotunes its channel-block size and warp count.
+    ``block_t`` is the backward recompute chunk width (peak extra HBM scales with
+    it); ``block_c`` the backward channel-slab width.
     """
     return _SelectiveLRUScan.apply(
-        delta_nu, delta_theta, a, omega, Bsel,
-        C_complex.real.contiguous(), C_complex.imag.contiguous(),
-        x, D, block_t, block_c, use_gamma,
+        delta_nu, delta_theta, a, omega,
+        Bsel_re.contiguous(), Bsel_im.contiguous(),
+        Csel_re.contiguous(), Csel_im.contiguous(),
+        x, D, block_t, block_c,
     )

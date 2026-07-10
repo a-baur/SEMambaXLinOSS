@@ -228,12 +228,7 @@ def _build_mixer_cls(d_model, model_cfg, layer_idx=0):
             dt_min=ssm_params.get("dt_min", 1e-3),
             dt_max=ssm_params.get("dt_max", 0.1),
             theta_max=ssm_params.get("theta_max", math.pi),
-            selective_init_std=ssm_params.get("init_std", 1e-2),
-            input_norm=ssm_params.get("input_norm", "delta_nu"),
-            mag_init=ssm_params.get("mag_init", "mamba"),
-            r_min=ssm_params.get("r_min", 0.9),
-            r_max=ssm_params.get("r_max", 0.999),
-            rank=ssm_params.get("rank", 0),
+            n_real_modes=ssm_params.get("n_real_modes", 0),
             use_triton=ssm_params.get("use_triton", False),
             chunk_size=ssm_params.get("chunk_size", 16),
             block_c=ssm_params.get("block_c", 32),
@@ -334,13 +329,24 @@ def create_block(
 
 
 class MambaBlock(nn.Module):
+    """Bi- or uni-directional scan block.
+
+    ``cfg["bidirectional"]`` (default True) selects the mode. Bidirectional output is
+    the fwd/bwd concat (``2 * in_channels``); unidirectional (causal along the scanned
+    axis) output keeps ``in_channels``. Set ``bidirectional: false`` in the
+    ``time_mixer`` sub-config for a streamable time branch; the frequency branch runs
+    within a frame, so it can stay bidirectional at zero lookahead cost.
+    """
+
     def __init__(self, in_channels, cfg):
         super(MambaBlock, self).__init__()
         n_layer = 1
+        self.bidirectional = cfg.get("bidirectional", True)
         self.forward_blocks = nn.ModuleList(create_block(in_channels, cfg) for _ in range(n_layer))
-        self.backward_blocks = nn.ModuleList(
-            create_block(in_channels, cfg) for _ in range(n_layer)
-        )
+        if self.bidirectional:
+            self.backward_blocks = nn.ModuleList(
+                create_block(in_channels, cfg) for _ in range(n_layer)
+            )
 
         self.apply(
             partial(
@@ -350,15 +356,19 @@ class MambaBlock(nn.Module):
         )
 
     def forward(self, x):
-        x_forward, x_backward = x.clone(), torch.flip(x, [1])
-        resi_forward, resi_backward = None, None
+        x_forward = x
+        resi_forward = None
 
         # Forward
         for layer in self.forward_blocks:
             x_forward, resi_forward = layer(x_forward, resi_forward)
         y_forward = (x_forward + resi_forward) if resi_forward is not None else x_forward
 
+        if not self.bidirectional:
+            return y_forward
+
         # Backward
+        x_backward, resi_backward = torch.flip(x, [1]), None
         for layer in self.backward_blocks:
             x_backward, resi_backward = layer(x_backward, resi_backward)
         y_backward = (
@@ -422,9 +432,26 @@ class TFMambaBlock(nn.Module):
         self.time_mamba = MambaBlock(in_channels=self.hid_feature, cfg=time_cfg)
         self.freq_mamba = MambaBlock(in_channels=self.hid_feature, cfg=freq_cfg)
 
-        # Initialize ConvTranspose1d layers
-        self.tlinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
-        self.flinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
+        # Post-mixer channel projections. A kernel-1 ConvTranspose1d is just a
+        # linear map over channels; nn.Linear on the last dim computes the same thing
+        # without the two permutes per call. Unidirectional branches output C (not 2C)
+        # channels, so widths match the branch mode.
+        t_width = self.hid_feature * (2 if self.time_mamba.bidirectional else 1)
+        f_width = self.hid_feature * (2 if self.freq_mamba.bidirectional else 1)
+        self.tlinear = nn.Linear(t_width, self.hid_feature)
+        self.flinear = nn.Linear(f_width, self.hid_feature)
+
+        # Optional learned per-frequency-bin embedding (model_cfg["freq_emb_bins"]).
+        # The time branch folds the bin axis into the batch, so its dynamics are
+        # bin-agnostic; this gives each latent bin an identity (low bins: harmonics /
+        # slow envelopes; high bins: frication / fast transients). Zero-initialized:
+        # a no-op at init, so old checkpoints load via strict=False unchanged.
+        n_bins = mcfg.get("freq_emb_bins", None)
+        if n_bins:
+            self.freq_emb = nn.Parameter(torch.zeros(n_bins, self.hid_feature))
+            self.freq_emb._no_weight_decay = True
+        else:
+            self.freq_emb = None
 
     def forward(self, x):
         """Forward pass of the TFMamba block.
@@ -437,9 +464,16 @@ class TFMambaBlock(nn.Module):
         """
         b, c, t, f = x.size()
 
+        if self.freq_emb is not None:
+            assert f == self.freq_emb.shape[0], (
+                f"freq_emb_bins={self.freq_emb.shape[0]} but latent input has {f} "
+                "frequency bins; set model_cfg['freq_emb_bins'] to the latent bin count."
+            )
+            x = x + self.freq_emb.t().unsqueeze(0).unsqueeze(2)   # (1, C, 1, F)
+
         x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
-        x = self.tlinear(self.time_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+        x = self.tlinear(self.time_mamba(x)) + x
         x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
-        x = self.flinear(self.freq_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+        x = self.flinear(self.freq_mamba(x)) + x
         x = x.view(b, t, f, c).permute(0, 3, 1, 2)
         return x
