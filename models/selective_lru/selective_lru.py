@@ -71,6 +71,17 @@ class SelectiveLRU(nn.Module):
         dt_min, dt_max: Baseline timestep band (Mamba dt init). Defaults 1e-3, 0.1.
         theta_max: Top of the oscillator phase grid at init. Default pi.
         n_real_modes: Leading modes initialized as real poles. Default 0.
+        envelope_readout: Add the quadratic band-power readout ``y += <g, |h|^2>``
+            (learned static ``g``, zero-init). Rotation-invariant envelope feature a
+            linear readout cannot express; well-scaled because of the gamma input
+            normalization. Default False.
+        mode_detune: Per-mode gains on the selective detuning,
+            ``theta = delta_nu * (omega + s * delta_theta)`` (learned static ``s``,
+            ones-init), lifting the rigid-rotation constraint on each channel's mode
+            bank. Default False.
+        rate_scale: Frame-rate conditioning factor multiplying the selective step
+            (``fps_ref / fps``); makes the continuous-time semantics transferable
+            across frame rates. Overridable per forward call. Default 1.0.
         use_triton: Run the fused CUDA kernel (state stays in registers; backward
             recomputes in chunks) instead of the materialized reference path.
         chunk_size: Backward recompute chunk width (peak extra HBM scales with it).
@@ -91,6 +102,9 @@ class SelectiveLRU(nn.Module):
         dt_max: float = 0.1,
         theta_max: float = math.pi,
         n_real_modes: int = 0,
+        envelope_readout: bool = False,
+        mode_detune: bool = False,
+        rate_scale: float = 1.0,
         use_triton: bool = False,
         chunk_size: int = 16,
         block_c: int = 32,
@@ -103,6 +117,9 @@ class SelectiveLRU(nn.Module):
         self.d_model = d_model
         self.d_state = d_state
         self.n_real_modes = n_real_modes
+        self.envelope_readout = envelope_readout
+        self.mode_detune = mode_detune
+        self.rate_scale = float(rate_scale)
         self.use_triton = use_triton
         self.chunk_size = chunk_size
         self.block_c = block_c
@@ -138,43 +155,90 @@ class SelectiveLRU(nn.Module):
             self.dt_nu_up.bias.copy_(_inv_softplus(dt))
             self.dt_theta_up.bias.zero_()
 
+        # Quadratic envelope readout y += <g, |h|^2>: per-(channel, mode) band
+        # power, i.e. the demodulated envelope of that modulation band. Zero-init:
+        # exact no-op at start, learned from zero.
+        if envelope_readout:
+            self.env_gain = nn.Parameter(torch.zeros(d_model, N))
+            self.env_gain._no_weight_decay = True
+        # Per-mode detune gains: theta = delta_nu * (omega + s * delta_theta), so a
+        # token can move modes non-rigidly. Ones-init: identical to the shared
+        # detuning at start.
+        if mode_detune:
+            self.detune_gain = nn.Parameter(torch.ones(d_model, N))
+            self.detune_gain._no_weight_decay = True
+
         self.dt_nu_up.bias._no_reinit = True
         self.dt_theta_up.bias._no_reinit = True
         self.A_log._no_weight_decay = True
         self.omega._no_weight_decay = True
         self.D._no_weight_decay = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_init: torch.Tensor | None = None,
+        rate_scale: float | None = None,
+        return_final_state: bool = False,
+    ):
+        """Apply the SSM. ``h_init``: optional initial state, complex ``(B, C, N)``
+        (e.g. the detached final state of the previous chunk for TBPTT / streaming).
+        ``rate_scale``: per-call override of the frame-rate conditioning; the
+        selective step is ``rate_scale * softplus(...)``, so a model trained at a
+        reference frame rate transfers to rate ``fps`` via ``fps_ref / fps``.
+        ``return_final_state``: also return ``h_{T-1}`` as complex ``(B, C, N)``;
+        gradients flow through it unless the caller detaches.
+        """
         B_, T, C = x.shape
         r, N = self.dt_rank, self.d_state
 
         dnu_r, dth_r, B_sel, C_sel = torch.split(self.x_proj(x), [r, r, 2 * N, 2 * N], dim=-1)
         delta_nu = F.softplus(self.dt_nu_up(dnu_r))                   # (B, T, C) > 0
+        rs = self.rate_scale if rate_scale is None else float(rate_scale)
+        if rs != 1.0:
+            delta_nu = delta_nu * rs
         delta_theta = self.dt_theta_up(dth_r)                         # (B, T, C)
         a = torch.exp(self.A_log)                                     # (C, N) > 0
 
+        g = self.env_gain if self.envelope_readout else None
+        s = self.detune_gain if self.mode_detune else None
+        h0_re = h_init.real.contiguous() if h_init is not None else None
+        h0_im = h_init.imag.contiguous() if h_init is not None else None
+
         if self.use_triton:
             from models.selective_lru.selective_lru_triton import fused_selective_lru
-            return fused_selective_lru(
+            y, hf_re, hf_im = fused_selective_lru(
                 delta_nu, delta_theta, a, self.omega,
                 B_sel[..., :N], B_sel[..., N:], C_sel[..., :N], C_sel[..., N:],
-                x, self.D, block_t=self.chunk_size, block_c=self.block_c,
+                x, self.D, g, s, h0_re, h0_im,
+                block_t=self.chunk_size, block_c=self.block_c,
+                want_final_state=return_final_state,
             )
+            if return_final_state:
+                return y, torch.complex(hf_re, hf_im)
+            return y
 
         # Materialized reference path (CPU / debugging).
         nu = torch.exp(-delta_nu.unsqueeze(-1) * a)                   # (B, T, C, N)
-        theta = delta_nu.unsqueeze(-1) * (self.omega + delta_theta.unsqueeze(-1))
+        dth_n = delta_theta.unsqueeze(-1)
+        base = self.omega + (s * dth_n if s is not None else dth_n)
+        theta = delta_nu.unsqueeze(-1) * base
         lam = torch.polar(nu, theta)
         gain = torch.sqrt((1.0 - nu * nu).clamp_min(1e-6))
         Bmat = torch.complex(B_sel[..., :N], B_sel[..., N:]).unsqueeze(-2)  # (B, T, 1, N)
         Bu = (gain * x.unsqueeze(-1)) * Bmat                          # (B, T, C, N) complex
 
-        h = _selective_recurrence(lam.reshape(B_, T, C * N), Bu.reshape(B_, T, C * N))
+        h0 = torch.complex(h0_re, h0_im).reshape(B_, C * N) if h_init is not None else None
+        h = _selective_recurrence(lam.reshape(B_, T, C * N), Bu.reshape(B_, T, C * N), h0)
         h = h.reshape(B_, T, C, N)
 
         C_complex = torch.complex(C_sel[..., :N], C_sel[..., N:])
-        Cy = torch.einsum("btn,btcn->btc", C_complex, h).real
-        return Cy + x * self.D
+        y = torch.einsum("btn,btcn->btc", C_complex, h).real + x * self.D
+        if g is not None:
+            y = y + torch.einsum("cn,btcn->btc", g, h.real ** 2 + h.imag ** 2)
+        if return_final_state:
+            return y, h[:, -1]
+        return y
 
 
 class SelectiveLRUMIMO(nn.Module):
@@ -206,7 +270,6 @@ class SelectiveLRUMIMO(nn.Module):
             self.nu_proj.weight.normal_(0.0, selective_init_std)
             self.theta_proj.weight.normal_(0.0, selective_init_std)
 
-        # These biases are the r/theta init; protect them from _init_weights.
         self.nu_proj.bias._no_reinit = True
         self.theta_proj.bias._no_reinit = True
 
@@ -240,9 +303,11 @@ class SelectiveLRUMIMO(nn.Module):
         return Cy + x * self.D
 
 
-def _selective_recurrence(lam: torch.Tensor, Bu: torch.Tensor) -> torch.Tensor:
+def _selective_recurrence(
+    lam: torch.Tensor, Bu: torch.Tensor, h0: torch.Tensor | None = None
+) -> torch.Tensor:
     B, T, N = Bu.shape
-    h = Bu.new_zeros(B, N)
+    h = Bu.new_zeros(B, N) if h0 is None else h0
     out = Bu.new_empty(B, T, N)
     for t in range(T):
         h = lam[:, t] * h + Bu[:, t]
