@@ -3,15 +3,10 @@
 base: ../base.yaml
 
 model_cfg:
-  # freq_emb_bins: 101   # architecture-level, deliberately OFF for core-only claims.
-                         # If enabled: latent F' after the dense encoder; verify via
-                         # x.shape[-1] at the first TFMambaBlock (101 for n_fft=400,
-                         # stride-2, k=3, p=1 -- floor((201+2-3)/2)+1).
-
   time_mixer:
-    d_state: 16
+    d_state: 8
     d_conv: 4
-    expand: 3
+    expand: 4
     norm_epsilon: 1.0e-05
     causal_conv: true
     # bidirectional: false      # streamable variant; required if you want the
@@ -27,24 +22,18 @@ model_cfg:
       # 8 real poles + 24 oscillators tiling ~0.53..20 Hz modulation
       # (theta_max = 0.8 rad/frame at 160 fps).
       theta_max: 0.8
-      n_real_modes: 8
-      # Band-power readout <g,|h|^2>: on the time axis this is a learned
-      # modulation-energy feature; on real poles a smoothed-energy tracker.
-      envelope_readout: true
-      # Per-mode detune gains s (ones-init): lets tokens deform the bank;
-      # learnable s->0 on the real poles keeps integrators real.
-      mode_detune: true
-      # fps_ref / fps. 1.0 = trained-at rate (160 fps). Change ONLY at
-      # inference for cross-rate transfer, e.g. 1.6 when running at 100 fps.
+      n_real_modes: 1
+      envelope_readout: false
+      mode_detune: false
       rate_scale: 1.0
       use_triton: true
       chunk_size: 16
       block_c: 16              # N=32: backward register budget
 
   freq_mixer:
-    d_state: 16
+    d_state: 8
     d_conv: 4
-    expand: 3
+    expand: 4
     norm_epsilon: 1.0e-05
     causal_conv: true
     ssm: selective_lru
@@ -56,10 +45,10 @@ model_cfg:
       # 4 real poles + 12 oscillators over (0, pi], spacing ~0.26 rad:
       # smooth envelope up to harmonic-comb periodicity.
       theta_max: 3.141592653589793
-      n_real_modes: 4
+      n_real_modes: 1
       # Envelope readout here = per-frame harmonic-band energy (voicing-like).
-      envelope_readout: true
-      mode_detune: true
+      envelope_readout: false
+      mode_detune: false
       # Frequency axis has no frame rate; keep 1.0 always.
       rate_scale: 1.0
       use_triton: true
