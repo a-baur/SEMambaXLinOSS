@@ -441,8 +441,14 @@ class TFMambaBlock(nn.Module):
         # channels, so widths match the branch mode.
         t_width = self.hid_feature * (2 if self.time_mamba.bidirectional else 1)
         f_width = self.hid_feature * (2 if self.freq_mamba.bidirectional else 1)
-        self.tlinear = nn.Linear(t_width, self.hid_feature)
-        self.flinear = nn.Linear(f_width, self.hid_feature)
+        
+        self.use_transpose = mcfg.get("use_transpose", True)
+        if self.use_transpose:
+            self.tlinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
+            self.flinear = nn.ConvTranspose1d(self.hid_feature * 2, self.hid_feature, 1, stride=1)
+        else:
+            self.tlinear = nn.Linear(t_width, self.hid_feature)
+            self.flinear = nn.Linear(f_width, self.hid_feature)
 
         # Optional learned per-frequency-bin embedding (model_cfg["freq_emb_bins"]).
         # The time branch folds the bin axis into the batch, so its dynamics are
@@ -475,8 +481,15 @@ class TFMambaBlock(nn.Module):
             x = x + self.freq_emb.t().unsqueeze(0).unsqueeze(2)   # (1, C, 1, F)
 
         x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
-        x = self.tlinear(self.time_mamba(x)) + x
-        x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
-        x = self.flinear(self.freq_mamba(x)) + x
+        
+        if self.use_transpose:
+            x = self.tlinear(self.time_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+            x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+            x = self.flinear(self.freq_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+        else:
+            x = self.tlinear(self.time_mamba(x)) + x
+            x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+            x = self.flinear(self.freq_mamba(x)) + x
+
         x = x.view(b, t, f, c).permute(0, 3, 1, 2)
         return x
