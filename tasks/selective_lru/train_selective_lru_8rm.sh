@@ -2,7 +2,7 @@
 #
 #SBATCH --cpus-per-task=32
 #SBATCH --ntasks=1
-#SBATCH --partition=a100
+#SBATCH --partition=a40
 #SBATCH --job-name=selective_lru
 #SBATCH --output=jobs/%x-%j.out
 #SBATCH --error=jobs/%x-%j.err
@@ -11,8 +11,7 @@
 #SBATCH --signal=B:SIGUSR1@120
 #SBATCH --open-mode=append
 #SBATCH --export=NONE
-#SBATCH --gres=gpu:a100:2
-#SBATCH -C a100_80
+#SBATCH --gres=gpu:a40
 
 source tasks/_env.sh
 source tasks/_requeue.sh
