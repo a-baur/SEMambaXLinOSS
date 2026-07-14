@@ -20,4 +20,4 @@ source tasks/_requeue.sh
 run_with_requeue srun --unbuffered --ntasks=1 python -u train.py \
   --config recipes/selective/SelectiveLRU.yaml \
   --exp_folder /home/atuin/f102ac/f102ac13/SEMambaBackbones/ \
-  --exp_name SelectiveLRU
+  --exp_name SelectiveLRUv3

@@ -3,6 +3,7 @@
 base: ../base.yaml
 
 model_cfg:
+  use_transpose: false
   time_mixer:
     d_state: 8
     d_conv: 4
