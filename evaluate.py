@@ -337,6 +337,22 @@ def evaluate_checkpoint(
     return summary
 
 
+def load_existing_summary(output_dir: str) -> dict | None:
+    """Return the stored summary block if ``<output_dir>/metrics.json`` exists.
+
+    ``metrics.json`` is written only after a checkpoint finishes evaluating, so
+    its presence marks a completed run whose result can be reused as-is.
+    """
+    out_json = os.path.join(output_dir, "metrics.json")
+    if not os.path.isfile(out_json):
+        return None
+    try:
+        with open(out_json) as f:
+            return json.load(f).get("summary")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def print_comparison_table(summaries: dict[str, dict]):
     """Print a name x mean-metric table, one row per checkpoint."""
     if not summaries:
@@ -383,6 +399,12 @@ def main():
         help="Number of fixed enhanced clips to save (alongside noisy/clean refs).",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-evaluate checkpoints even if their output metrics.json already exists "
+        "(default: skip and reuse the existing result).",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -403,8 +425,15 @@ def main():
         for d in ckpt_dirs:
             name = os.path.basename(d.rstrip("/"))
             print(f"\n{'#' * 60}\n# {name}\n{'#' * 60}")
-            ckpt_file, config_file = resolve_checkpoint_and_config(d, args.config)
             out_dir = os.path.join(args.output_dir, name)
+            if not args.force:
+                existing = load_existing_summary(out_dir)
+                if existing is not None:
+                    print(f"Skipping (found {os.path.join(out_dir, 'metrics.json')}); "
+                          "pass --force to re-evaluate.")
+                    summaries[name] = existing
+                    continue
+            ckpt_file, config_file = resolve_checkpoint_and_config(d, args.config)
             summaries[name] = evaluate_checkpoint(
                 ckpt_file, config_file, out_dir, args, device, evaluator_cache
             )
@@ -418,6 +447,10 @@ def main():
         return
 
     # Single-checkpoint mode.
+    if not args.force and load_existing_summary(args.output_dir) is not None:
+        print(f"Skipping (found {os.path.join(args.output_dir, 'metrics.json')}); "
+              "pass --force to re-evaluate.")
+        return
     ckpt_file, config_file = resolve_checkpoint_and_config(args.checkpoint, args.config)
     evaluate_checkpoint(
         ckpt_file, config_file, args.output_dir, args, device, evaluator_cache
