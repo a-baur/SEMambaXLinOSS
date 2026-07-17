@@ -37,6 +37,7 @@ def _selective_lru_fwd_kernel(
     DETUNE: tl.constexpr,
     HAS_H0: tl.constexpr,
     SAVE_HF: tl.constexpr,
+    GAIN: tl.constexpr,          # 0 = gamma (LRU), 1 = mamba (Euler), 2 = exact ZOH
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -85,18 +86,36 @@ def _selective_lru_fwd_kernel(
         Cr = tl.load(Cre_ptr + n_off, mask=mn, other=0.0)
         Ci = tl.load(Cim_ptr + n_off, mask=mn, other=0.0)
 
-        # lam = exp(dnu * (-a + j(om + s*dth)));  Bu = sqrt(1 - |lam|^2) * (Bsr + jBsi) * x
+        # lam = exp(dnu * (-a + j(om + s*dth)));  Bu = gain * (Bsr + jBsi) * x with
+        # gain in {sqrt(1-|lam|^2), dnu, (lam-1)/A_c} selected by GAIN.
         nu = tl.exp(-dnu[:, None] * a)
         if DETUNE:
-            th = dnu[:, None] * (om + sd * dth[:, None])
+            base = om + sd * dth[:, None]
         else:
-            th = dnu[:, None] * (om + dth[:, None])
+            base = om + dth[:, None]
+        th = dnu[:, None] * base
         lre = nu * tl.cos(th)
         lim = nu * tl.sin(th)
-        gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
+        if GAIN == 0:
+            gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
+            bur = gx * Bsr[None, :]
+            bui = gx * Bsi[None, :]
+        elif GAIN == 1:
+            gx = (dnu * xv)[:, None]
+            bur = gx * Bsr[None, :]
+            bui = gx * Bsi[None, :]
+        else:
+            # (lam - 1)/A_c with A_c = -a + j*base; expm1 form avoids cancellation.
+            sh = tl.sin(0.5 * th)
+            lm1r = tl.math.expm1(-dnu[:, None] * a) * tl.cos(th) - 2.0 * sh * sh
+            den = tl.maximum(a * a + base * base, 1e-8)
+            gr = (base * lim - a * lm1r) / den
+            gi = -(a * lim + base * lm1r) / den
+            bur = (gr * Bsr[None, :] - gi * Bsi[None, :]) * xv[:, None]
+            bui = (gr * Bsi[None, :] + gi * Bsr[None, :]) * xv[:, None]
 
-        new_hre = lre * hre - lim * him + gx * Bsr[None, :]
-        new_him = lre * him + lim * hre + gx * Bsi[None, :]
+        new_hre = lre * hre - lim * him + bur
+        new_him = lre * him + lim * hre + bui
         hre = new_hre
         him = new_him
 
@@ -135,6 +154,7 @@ def _selective_lru_bwd_kernel(
     DETUNE: tl.constexpr,
     HAS_DHF: tl.constexpr,
     NEED_DH0: tl.constexpr,
+    GAIN: tl.constexpr,          # 0 = gamma (LRU), 1 = mamba (Euler), 2 = exact ZOH
 ):
     pb = tl.program_id(0)
     pcb = tl.program_id(1)
@@ -199,14 +219,30 @@ def _selective_lru_bwd_kernel(
                 Bsi = tl.load(Bsi_ptr + n_off, mask=mn, other=0.0)
                 nu = tl.exp(-dnu[:, None] * a)
                 if DETUNE:
-                    th = dnu[:, None] * (om + sd * dth[:, None])
+                    base = om + sd * dth[:, None]
                 else:
-                    th = dnu[:, None] * (om + dth[:, None])
+                    base = om + dth[:, None]
+                th = dnu[:, None] * base
                 lre = nu * tl.cos(th)
                 lim = nu * tl.sin(th)
-                gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
-                n_re = lre * bre - lim * bim + gx * Bsr[None, :]
-                n_im = lre * bim + lim * bre + gx * Bsi[None, :]
+                if GAIN == 0:
+                    gx = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6)) * xv[:, None]
+                    bur = gx * Bsr[None, :]
+                    bui = gx * Bsi[None, :]
+                elif GAIN == 1:
+                    gx = (dnu * xv)[:, None]
+                    bur = gx * Bsr[None, :]
+                    bui = gx * Bsi[None, :]
+                else:
+                    sh = tl.sin(0.5 * th)
+                    lm1r = tl.math.expm1(-dnu[:, None] * a) * tl.cos(th) - 2.0 * sh * sh
+                    den = tl.maximum(a * a + base * base, 1e-8)
+                    gr = (base * lim - a * lm1r) / den
+                    gi = -(a * lim + base * lm1r) / den
+                    bur = (gr * Bsr[None, :] - gi * Bsi[None, :]) * xv[:, None]
+                    bui = (gr * Bsi[None, :] + gi * Bsr[None, :]) * xv[:, None]
+                n_re = lre * bre - lim * bim + bur
+                n_im = lre * bim + lim * bre + bui
                 bre = n_re
                 bim = n_im
                 tl.store(ht_re_ptr + ht_cbase + li * N, bre, mask=m2)
@@ -245,7 +281,6 @@ def _selective_lru_bwd_kernel(
                 th = dnu[:, None] * base
                 costh = tl.cos(th)
                 sinth = tl.sin(th)
-                gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
 
                 # g_t = dy * conj(C) [+ 2*dy*g*h_t from the envelope term];
                 # G_t = g_t + conj(lambda_{t+1}) G_{t+1}.
@@ -259,16 +294,55 @@ def _selective_lru_bwd_kernel(
                 Gti = gim + lnr * Gim - lni * Gre
 
                 # Input map Bu = gain * (Bsr + jBsi) * x;  dBu = G_t (complex).
-                s = Gtr * Bsr[None, :] + Gti * Bsi[None, :]
-                dBsr_c = tl.sum(tl.where(m2, Gtr * gain * xv[:, None], 0.0), axis=0)
-                dBsi_c = tl.sum(tl.where(m2, Gti * gain * xv[:, None], 0.0), axis=0)
+                if GAIN == 0:
+                    gain = tl.sqrt(tl.maximum(1.0 - nu * nu, 1e-6))
+                    sBG = Gtr * Bsr[None, :] + Gti * Bsi[None, :]
+                    dBsr_c = tl.sum(tl.where(m2, Gtr * gain * xv[:, None], 0.0), axis=0)
+                    dBsi_c = tl.sum(tl.where(m2, Gti * gain * xv[:, None], 0.0), axis=0)
+                    dx_bu = tl.sum(tl.where(m2, sBG * gain, 0.0), axis=1)
+                    # gain = sqrt(1 - nu^2): the input map feeds gradient into nu too.
+                    dnu_bu = (sBG * xv[:, None]) * (-nu / gain)
+                    d_dnu_bu = tl.sum(tl.where(m2, dnu_bu * (-a) * nu, 0.0), axis=1)
+                    da_bu = dnu_bu * (-dnu[:, None]) * nu
+                elif GAIN == 1:
+                    sBG = Gtr * Bsr[None, :] + Gti * Bsi[None, :]
+                    gx = dnu * xv
+                    dBsr_c = tl.sum(tl.where(m2, Gtr * gx[:, None], 0.0), axis=0)
+                    dBsi_c = tl.sum(tl.where(m2, Gti * gx[:, None], 0.0), axis=0)
+                    dx_bu = tl.sum(tl.where(m2, sBG * dnu[:, None], 0.0), axis=1)
+                    d_dnu_bu = tl.sum(tl.where(m2, sBG * xv[:, None], 0.0), axis=1)
+                    da_bu = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
+                else:
+                    # gain = (lam - 1)/A_c (complex), A_c = -a + j*base.
+                    lre = nu * costh
+                    lim = nu * sinth
+                    sh = tl.sin(0.5 * th)
+                    lm1r = tl.math.expm1(-dnu[:, None] * a) * costh - 2.0 * sh * sh
+                    den = tl.maximum(a * a + base * base, 1e-8)
+                    gr = (base * lim - a * lm1r) / den
+                    gi = -(a * lim + base * lm1r) / den
+                    # dB = x * conj(gain) * G, reduced over channels.
+                    dBsr_c = tl.sum(tl.where(m2, (gr * Gtr + gi * Gti) * xv[:, None], 0.0), axis=0)
+                    dBsi_c = tl.sum(tl.where(m2, (gr * Gti - gi * Gtr) * xv[:, None], 0.0), axis=0)
+                    # dx = sum_n Re(conj(gain * B) * G).
+                    wre = gr * Bsr[None, :] - gi * Bsi[None, :]
+                    wim = gr * Bsi[None, :] + gi * Bsr[None, :]
+                    dx_bu = tl.sum(tl.where(m2, wre * Gtr + wim * Gti, 0.0), axis=1)
+                    # d(gain) as a complex adjoint: dgain = x * conj(B) * G.
+                    dgr = xv[:, None] * (Bsr[None, :] * Gtr + Bsi[None, :] * Gti)
+                    dgi = xv[:, None] * (Bsr[None, :] * Gti - Bsi[None, :] * Gtr)
+                    # d gain / d dnu = lam (exactly).
+                    d_dnu_bu = tl.sum(tl.where(m2, dgr * lre + dgi * lim, 0.0), axis=1)
+                    # d gain / d A_c = (dnu*lam - gain)/A_c =: q;
+                    # d/da = -q, d/d base = j*q  (A_c = -a + j*base).
+                    pr = dnu[:, None] * lre - gr
+                    pi = dnu[:, None] * lim - gi
+                    q_re = (base * pi - a * pr) / den
+                    q_im = -(a * pi + base * pr) / den
+                    da_bu = -(dgr * q_re + dgi * q_im)
+                    dwt_g = dgi * q_re - dgr * q_im
                 tl.atomic_add(dBsr_ptr + n_off, dBsr_c, mask=mn)
                 tl.atomic_add(dBsi_ptr + n_off, dBsi_c, mask=mn)
-                dx_bu = tl.sum(tl.where(m2, s * gain, 0.0), axis=1)
-                # gain = sqrt(1 - nu^2): the input map feeds gradient into nu too.
-                dnu_bu = (s * xv[:, None]) * (-nu / gain)
-                d_dnu_bu = tl.sum(tl.where(m2, dnu_bu * (-a) * nu, 0.0), axis=1)
-                da_bu = dnu_bu * (-dnu[:, None]) * nu
 
                 # dlam = G_t conj(h_{t-1}); nu and theta = dnu * (om + dth) chains.
                 dlre = Gtr * hm_re + Gti * hm_im
@@ -278,12 +352,17 @@ def _selective_lru_bwd_kernel(
                 d_dnu_lam = tl.sum(
                     tl.where(m2, dnu_n * (-a) * nu + dth_n * base, 0.0), axis=1
                 )
-                if DETUNE:
-                    d_dth = tl.sum(tl.where(m2, dth_n * dnu[:, None] * sd, 0.0), axis=1)
-                    ds_acc += dth_n * dnu[:, None] * dth[:, None]
+                # Total gradient into omega~ = base: theta chain + (zoh) gain chain.
+                if GAIN == 2:
+                    dwt = dth_n * dnu[:, None] + dwt_g
                 else:
-                    d_dth = tl.sum(tl.where(m2, dth_n * dnu[:, None], 0.0), axis=1)
-                dom_acc += dth_n * dnu[:, None]
+                    dwt = dth_n * dnu[:, None]
+                if DETUNE:
+                    d_dth = tl.sum(tl.where(m2, dwt * sd, 0.0), axis=1)
+                    ds_acc += dwt * dth[:, None]
+                else:
+                    d_dth = tl.sum(tl.where(m2, dwt, 0.0), axis=1)
+                dom_acc += dwt
                 da_acc += dnu_n * (-dnu[:, None]) * nu + da_bu
 
                 # Readout grads at t (need h_t): dC reduces over channels (atomic).
@@ -319,7 +398,7 @@ def _selective_lru_bwd_kernel(
 class _SelectiveLRUScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, delta_nu, delta_theta, a, omega, Bsr, Bsi, Cre, Cim, x, D,
-                g, s, h0_re, h0_im, block_t, block_c, want_final_state):
+                g, s, h0_re, h0_im, block_t, block_c, want_final_state, gain_mode):
         # Unused-output grads arrive as None (not materialized zeros), so the
         # backward can branch on plain Python bools without a GPU sync.
         ctx.set_materialize_grads(False)
@@ -372,6 +451,7 @@ class _SelectiveLRUScan(torch.autograd.Function):
             B, T, C, N, NC,
             BLOCK_N=_block_n(N), BLOCK_T=block_t, SAVE_CKPT=save,
             ENVELOPE=envelope, DETUNE=detune, HAS_H0=has_h0, SAVE_HF=save_hf,
+            GAIN=gain_mode,
         )
 
         if save:
@@ -381,6 +461,7 @@ class _SelectiveLRUScan(torch.autograd.Function):
             ctx.block_t = block_t
             ctx.block_c = block_c
             ctx.flags = (envelope, detune, has_h0)
+            ctx.gain_mode = gain_mode
         return y, hf_re, hf_im
 
     @staticmethod
@@ -434,13 +515,14 @@ class _SelectiveLRUScan(torch.autograd.Function):
             B, T, C, N, NC,
             BLOCK_C=BLOCK_C, BLOCK_N=_block_n(N), BLOCK_T=BLOCK_T,
             ENVELOPE=envelope, DETUNE=detune, HAS_DHF=has_dhf, NEED_DH0=need_dh0,
+            GAIN=ctx.gain_mode,
             num_warps=4,
         )
 
         return (d_dnu, d_dth, da, dom, dBsr, dBsi, dCre, dCim, dx, dD,
                 dg if envelope else None, ds if detune else None,
                 dh0r if need_dh0 else None, dh0i if need_dh0 else None,
-                None, None, None)
+                None, None, None, None)
 
 
 def fused_selective_lru(
@@ -461,6 +543,7 @@ def fused_selective_lru(
     block_t: int = 16,
     block_c: int = 32,
     want_final_state: bool = False,
+    input_gain: str = "gamma",
 ):
     """Fused selective-LRU scan + readout.
 
@@ -468,19 +551,27 @@ def fused_selective_lru(
     state parts of shape ``(B, C, N)`` (dummy 1-element tensors unless
     ``want_final_state`` or gradients are required).
 
-        lam = exp(delta_nu * (-a + j*(omega [+ s*] delta_theta)))
-        Bu  = sqrt(1 - |lam|^2) * (Bsel_re + j*Bsel_im) * x
-        h_t = lam_t * h_{t-1} + Bu_t      (h_{-1} = h0, default 0)
-        y   = Re(<C, h>) [+ <g, |h|^2>] + D * x
+        lam  = exp(delta_nu * (-a + j*(omega [+ s*] delta_theta)))
+        Bu   = gain * (Bsel_re + j*Bsel_im) * x
+        h_t  = lam_t * h_{t-1} + Bu_t      (h_{-1} = h0, default 0)
+        y    = Re(<C, h>) [+ <g, |h|^2>] + D * x
+
+    ``input_gain`` selects the input normalization (compile-time specialized):
+    ``"gamma"``: sqrt(1 - |lam|^2) (LRU energy norm); ``"mamba"``: delta_nu
+    (Euler / S6, real, shared over modes); ``"zoh"``: (lam - 1)/A_c with
+    A_c = -a + j*(omega [+ s*] delta_theta) (exact ZOH, complex per mode). The
+    gain is computed in registers from quantities the kernel already holds; it
+    is never materialized in HBM.
 
     Optional pieces (compile-time specialized; absent tensors cost nothing):
     ``g`` enables the quadratic envelope readout, ``s`` the per-mode detune gains,
     ``h0_*`` the initial state (gradient supported), and a gradient arriving on the
     final state is injected into the adjoint, so chunked/TBPTT training composes.
     """
+    gain_mode = {"gamma": 0, "mamba": 1, "zoh": 2}[input_gain]
     return _SelectiveLRUScan.apply(
         delta_nu, delta_theta, a, omega,
         Bsel_re.contiguous(), Bsel_im.contiguous(),
         Csel_re.contiguous(), Csel_im.contiguous(),
-        x, D, g, s, h0_re, h0_im, block_t, block_c, want_final_state,
+        x, D, g, s, h0_re, h0_im, block_t, block_c, want_final_state, gain_mode,
     )

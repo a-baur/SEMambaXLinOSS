@@ -1,0 +1,58 @@
+# SelectiveLRU v3 feature-testing baseline. All four new mechanisms ON here;
+# ablation arms toggle flags off one at a time (see ladder below).
+base: ../base.yaml
+
+model_cfg:
+  time_mixer:
+    d_state: 8
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    # bidirectional: false      # streamable variant; required if you want the
+                                # state-passing API to be end-to-end meaningful
+    ssm: selective_lru
+    ssm_params:
+      # Full heuristic rank per path (ceil(hid/16)=4). dt_rank: 2 was the
+      # Mamba-parity split; feature ablations should not be Delta-starved.
+      dt_rank: 4
+      # Memory band 1/(dt*a): ~10..1000 frames (62 ms .. 6 s at 160 fps).
+      dt_min: 0.001
+      dt_max: 0.1
+      # 8 real poles + 24 oscillators tiling ~0.53..20 Hz modulation
+      # (theta_max = 0.8 rad/frame at 160 fps).
+      theta_max: 0.8
+      n_real_modes: 4
+      envelope_readout: false
+      mode_detune: false
+      rate_scale: 1.0
+      use_triton: true
+      chunk_size: 16
+      block_c: 16              # N=32: backward register budget
+      input_gain: zoh
+
+  freq_mixer:
+    d_state: 8
+    d_conv: 4
+    expand: 4
+    norm_epsilon: 1.0e-05
+    causal_conv: true
+    ssm: selective_lru
+    ssm_params:
+      dt_rank: 4
+      # Shorter memory band: ~3..200 bins on a ~100-bin axis.
+      dt_min: 0.005
+      dt_max: 0.3
+      # 4 real poles + 12 oscillators over (0, pi], spacing ~0.26 rad:
+      # smooth envelope up to harmonic-comb periodicity.
+      theta_max: 3.141592653589793
+      n_real_modes: 4
+      # Envelope readout here = per-frame harmonic-band energy (voicing-like).
+      envelope_readout: false
+      mode_detune: false
+      # Frequency axis has no frame rate; keep 1.0 always.
+      rate_scale: 1.0
+      use_triton: true
+      chunk_size: 16
+      block_c: 32
+      input_gain: zoh

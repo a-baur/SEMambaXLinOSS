@@ -1,0 +1,19 @@
+# LinOSS -- inherits shared config from base.yaml; only the mixer block differs.
+base: ../base.yaml
+
+model_cfg:
+  use_phase_fan: false
+  use_fan_denseblock: false
+  ssm: selective_linoss
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  norm_epsilon: 1.0e-05
+  causal_conv: true
+  ssm_params:
+    selective_dt: true
+    selective_a: true
+    selective_gate: true
+    sel_rank:
+    dt_max:  1.0
+    use_triton: true

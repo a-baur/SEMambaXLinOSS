@@ -13,9 +13,14 @@ Supports three checkpoint layouts:
 
 Outputs:
   * ``<output_dir>/metrics.json`` -- per-utterance PESQ / MR-STFT / UTMOS
-    plus a summary block with the mean and variance of each.
-  * ``<output_dir>/samples/<utt>_{noisy,enhanced,clean}.wav`` -- a fixed,
-    deterministic subset of enhanced clips with their noisy / clean refs.
+    plus a summary block with the mean and variance of each. When an SNR
+    manifest is supplied (``--snr_json``), the summary also carries a
+    ``per_snr`` block breaking every mean/variance down by input-SNR category.
+  * ``<output_dir>/samples/<cat>/<utt>_{noisy,enhanced,clean}.wav`` -- a fixed,
+    deterministic subset of enhanced clips with their noisy / clean refs. With
+    an SNR manifest the subset is drawn evenly from each SNR category (the
+    first ``--num_samples`` utterances of each); otherwise the first
+    ``--num_samples`` utterances overall.
   * ``<output_dir>/comparison.json`` (compare mode only) -- the per-checkpoint
     summary blocks gathered into one file.
 """
@@ -124,6 +129,54 @@ METRIC_LABELS = {
 }
 
 
+def _fmt_edge(x: float) -> str:
+    """Render an SNR bin edge without a trailing ``.0`` (e.g. ``5`` not ``5.0``)."""
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+def snr_category(snr: float | None, edges: list[float]) -> str:
+    """Label the SNR bin ``snr`` falls in, given ascending ``edges``.
+
+    Edges ``[0, 5, 10]`` produce ``"<0dB"``, ``"0-5dB"``, ``"5-10dB"``,
+    ``">=10dB"``. A missing SNR maps to ``"unknown"``.
+    """
+    if snr is None or (isinstance(snr, float) and math.isnan(snr)):
+        return "unknown"
+    if snr < edges[0]:
+        return f"<{_fmt_edge(edges[0])}dB"
+    for lo, hi in zip(edges, edges[1:]):
+        if lo <= snr < hi:
+            return f"{_fmt_edge(lo)}-{_fmt_edge(hi)}dB"
+    return f">={_fmt_edge(edges[-1])}dB"
+
+
+def snr_category_order(edges: list[float]) -> list[str]:
+    """The category labels in ascending-SNR order (``unknown`` last)."""
+    labels = [f"<{_fmt_edge(edges[0])}dB"]
+    labels += [f"{_fmt_edge(lo)}-{_fmt_edge(hi)}dB" for lo, hi in zip(edges, edges[1:])]
+    labels += [f">={_fmt_edge(edges[-1])}dB", "unknown"]
+    return labels
+
+
+def load_snr_map(snr_json: str | None) -> dict[str, float] | None:
+    """Load ``snr_json`` into an ``identifier -> snr`` dict, or ``None``.
+
+    Keys are reduced to the same SNR-suffix-stripped, dataset-relative
+    identifier the dataloader uses (via ``extract_identifier``), so a noisy
+    wav path can be matched to its SNR the same way it is matched to its clean
+    reference. Returns ``None`` if no manifest is given or it cannot be read.
+    """
+    if not snr_json:
+        return None
+    if not os.path.isfile(snr_json):
+        warnings.warn(f"SNR manifest not found at {snr_json}; skipping stratification.")
+        return None
+    with open(snr_json) as f:
+        raw = json.load(f)
+    root = _common_root(list(raw.keys()))
+    return {extract_identifier(k, root): float(v) for k, v in raw.items()}
+
+
 def load_generator(ckpt_file: str, cfg: dict, device: torch.device) -> SEMamba:
     model = SEMamba(cfg).to(device)
     state = torch.load(ckpt_file, map_location=device)
@@ -152,7 +205,17 @@ def enhance(model: SEMamba, noisy_wav: torch.Tensor, cfg: dict) -> torch.Tensor:
     return (audio_g / norm).squeeze(0)
 
 
-def build_pair_list(cfg: dict, test_clean_json: str | None, test_noisy_json: str | None):
+def build_pair_list(
+    cfg: dict,
+    test_clean_json: str | None,
+    test_noisy_json: str | None,
+    snr_by_id: dict[str, float] | None = None,
+):
+    """Return a list of ``(noisy_path, clean_path, snr)`` triples.
+
+    ``snr`` is the input SNR (dB) looked up from ``snr_by_id`` for the noisy
+    file, or ``None`` when no manifest is given or the file is absent from it.
+    """
     clean_json = test_clean_json or cfg["data_cfg"]["test_clean_json"]
     noisy_json = test_noisy_json or cfg["data_cfg"]["test_noisy_json"]
     with open(clean_json) as f:
@@ -171,14 +234,22 @@ def build_pair_list(cfg: dict, test_clean_json: str | None, test_noisy_json: str
 
     pairs = []
     missing = 0
+    snr_missing = 0
     for noisy in noisy_sorted:
         clean = get_clean_path_for_noisy(noisy, noisy_root, clean_by_id)
         if clean is None:
             missing += 1
             continue
-        pairs.append((noisy, clean))
+        snr = None
+        if snr_by_id is not None:
+            snr = snr_by_id.get(extract_identifier(noisy, noisy_root))
+            if snr is None:
+                snr_missing += 1
+        pairs.append((noisy, clean, snr))
     if missing:
         warnings.warn(f"{missing} noisy files had no matching clean reference; skipped.")
+    if snr_by_id is not None and snr_missing:
+        warnings.warn(f"{snr_missing} noisy files had no SNR in the manifest; binned as 'unknown'.")
     return pairs
 
 
@@ -207,20 +278,44 @@ def evaluate_checkpoint(
         evaluator_cache[sr] = Evaluator(sr=sr).to(device)
     evaluator = evaluator_cache[sr]
 
-    pairs = build_pair_list(cfg, args.test_clean_json, args.test_noisy_json)
+    snr_by_id = getattr(args, "snr_by_id", None)
+    snr_edges = getattr(args, "snr_edges", None)
+    stratify = snr_by_id is not None and snr_edges is not None
+
+    pairs = build_pair_list(cfg, args.test_clean_json, args.test_noisy_json, snr_by_id)
     print(f"Evaluating {len(pairs)} utterances at {sr} Hz")
+
+    # Category per pair (None -> a single implicit "all" bucket when not stratifying).
+    if stratify:
+        pair_cats = [snr_category(snr, snr_edges) for (_, _, snr) in pairs]
+    else:
+        pair_cats = [None] * len(pairs)
 
     samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
-    sample_indices = set(range(min(args.num_samples, len(pairs))))
+    # Sample the first ``num_samples`` utterances of each category (or of the whole
+    # set when not stratifying), so every SNR band is represented in the saved clips.
+    sample_indices: set[int] = set()
+    seen_per_cat: dict[str | None, int] = {}
+    for idx, cat in enumerate(pair_cats):
+        taken = seen_per_cat.get(cat, 0)
+        if taken < args.num_samples:
+            sample_indices.add(idx)
+            seen_per_cat[cat] = taken + 1
 
     metric_names = METRIC_NAMES
     sums = {m: 0.0 for m in metric_names}
     sumsq = {m: 0.0 for m in metric_names}
     counts = {m: 0 for m in metric_names}
+    # Per-category accumulators, created lazily as categories appear.
+    strat_sums: dict[str, dict[str, float]] = {}
+    strat_sumsq: dict[str, dict[str, float]] = {}
+    strat_counts: dict[str, dict[str, int]] = {}
+    strat_utts: dict[str, int] = {}
     per_utt = []
 
-    for i, (noisy_path, clean_path) in enumerate(pairs):
+    for i, (noisy_path, clean_path, snr) in enumerate(pairs):
+        cat = pair_cats[i]
         noisy_np, _ = librosa.load(noisy_path, sr=sr)
         clean_np, _ = librosa.load(clean_path, sr=sr)
         noisy_t = torch.from_numpy(noisy_np).float().to(device)
@@ -254,6 +349,8 @@ def evaluate_checkpoint(
         row = {
             "noisy": noisy_path,
             "clean": clean_path,
+            "snr": snr,
+            "snr_category": cat,
             "pesq": pesq,
             "mrstft": metrics.mrstft,
             "utmos": metrics.utmos,
@@ -271,29 +368,41 @@ def evaluate_checkpoint(
             "complex": F.mse_loss(clean_com, enh_com).item(),
         }
         per_utt.append(row)
+        if stratify:
+            strat_utts[cat] = strat_utts.get(cat, 0) + 1
+            csum = strat_sums.setdefault(cat, {m: 0.0 for m in metric_names})
+            csumsq = strat_sumsq.setdefault(cat, {m: 0.0 for m in metric_names})
+            ccount = strat_counts.setdefault(cat, {m: 0 for m in metric_names})
         for m in metric_names:
             v = row[m]
             if v is not None and not math.isnan(v):
                 sums[m] += v
                 sumsq[m] += v * v
                 counts[m] += 1
+                if stratify:
+                    csum[m] += v
+                    csumsq[m] += v * v
+                    ccount[m] += 1
 
         if i in sample_indices:
+            # Group saved clips by SNR category (flat "samples/" when not stratifying).
+            dst = os.path.join(samples_dir, cat) if stratify else samples_dir
+            os.makedirs(dst, exist_ok=True)
             base = os.path.splitext(os.path.basename(noisy_path))[0]
             sf.write(
-                os.path.join(samples_dir, f"{base}_enhanced.wav"),
+                os.path.join(dst, f"{base}_enhanced.wav"),
                 enhanced.cpu().numpy(),
                 sr,
                 "PCM_16",
             )
             sf.write(
-                os.path.join(samples_dir, f"{base}_noisy.wav"),
+                os.path.join(dst, f"{base}_noisy.wav"),
                 noisy_np,
                 sr,
                 "PCM_16",
             )
             sf.write(
-                os.path.join(samples_dir, f"{base}_clean.wav"),
+                os.path.join(dst, f"{base}_clean.wav"),
                 clean_np,
                 sr,
                 "PCM_16",
@@ -322,6 +431,27 @@ def evaluate_checkpoint(
         **{f"var_{m}": variances[m] for m in metric_names},
         "samples_dir": samples_dir,
     }
+
+    if stratify:
+        # Per-category means/variances, in ascending-SNR order (empty bins dropped).
+        per_snr = {}
+        for cat in snr_category_order(snr_edges):
+            if cat not in strat_utts:
+                continue
+            cc, cs, css = strat_counts[cat], strat_sums[cat], strat_sumsq[cat]
+            cmeans = {m: cs[m] / max(cc[m], 1) for m in metric_names}
+            cvars = {
+                m: (css[m] - cs[m] * cs[m] / cc[m]) / (cc[m] - 1) if cc[m] > 1 else 0.0
+                for m in metric_names
+            }
+            per_snr[cat] = {
+                "num_utterances": strat_utts[cat],
+                "valid_counts": cc,
+                **{f"mean_{m}": cmeans[m] for m in metric_names},
+                **{f"var_{m}": cvars[m] for m in metric_names},
+            }
+        summary["per_snr"] = per_snr
+
     out_json = os.path.join(output_dir, "metrics.json")
     with open(out_json, "w") as f:
         json.dump({"summary": summary, "per_utterance": per_utt}, f, indent=2)
@@ -332,6 +462,8 @@ def evaluate_checkpoint(
             f"Mean {METRIC_LABELS[m]:<10}: {means[m]:.4f} (var {variances[m]:.4g}) "
             f"over {counts[m]}/{len(pairs)} utts"
         )
+    if stratify:
+        print_stratified_table(summary["per_snr"])
     print(f"Samples      : {samples_dir} ({len(sample_indices)} clips)")
     print(f"Per-utt log  : {out_json}")
     return summary
@@ -351,6 +483,27 @@ def load_existing_summary(output_dir: str) -> dict | None:
             return json.load(f).get("summary")
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def print_stratified_table(per_snr: dict[str, dict]):
+    """Print an SNR-category x mean-metric table, one row per category."""
+    if not per_snr:
+        return
+    cat_w = max(len("SNR"), max(len(c) for c in per_snr))
+    header = "  ".join(
+        [f"{'SNR':<{cat_w}}", f"{'N':>4}"]
+        + [f"{METRIC_LABELS[m]:>10}" for m in METRIC_NAMES]
+    )
+    print("\n" + "=" * len(header))
+    print("PER-SNR BREAKDOWN (means)")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for cat, block in per_snr.items():
+        cells = [f"{cat:<{cat_w}}", f"{block['num_utterances']:>4}"]
+        for m in METRIC_NAMES:
+            cells.append(f"{block[f'mean_{m}']:>10.4f}")
+        print("  ".join(cells))
 
 
 def print_comparison_table(summaries: dict[str, dict]):
@@ -396,7 +549,19 @@ def main():
         "--num_samples",
         type=int,
         default=10,
-        help="Number of fixed enhanced clips to save (alongside noisy/clean refs).",
+        help="Enhanced clips to save (with noisy/clean refs). With an SNR manifest, "
+        "this many per SNR category; otherwise this many overall.",
+    )
+    parser.add_argument(
+        "--snr_json",
+        default="data/snr/test_snr.json",
+        help="JSON mapping dataset-relative noisy paths to input SNR (dB); enables "
+        "per-SNR stratified metrics and sampling. Pass '' to disable.",
+    )
+    parser.add_argument(
+        "--snr_bins",
+        default="0,5,10,15",
+        help="Ascending, comma-separated SNR bin edges (dB) for stratification.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -409,6 +574,16 @@ def main():
 
     device = torch.device(args.device)
     evaluator_cache: dict = {}
+
+    # SNR stratification is opt-in and best-effort: a missing/empty manifest just
+    # falls back to unstratified metrics + first-N sampling.
+    args.snr_by_id = load_snr_map(args.snr_json)
+    args.snr_edges = None
+    if args.snr_by_id is not None:
+        args.snr_edges = sorted(float(e) for e in args.snr_bins.split(",") if e.strip())
+        if not args.snr_edges:
+            warnings.warn("--snr_bins parsed to no edges; disabling stratification.")
+            args.snr_by_id = None
 
     # Compare mode: a parent directory of checkpoint dirs (ckpts/mamba, ...).
     if os.path.isdir(args.checkpoint) and not is_checkpoint_dir(args.checkpoint):

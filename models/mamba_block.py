@@ -9,7 +9,7 @@ from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba3 import Mamba3
 
-from models.linoss import LinOSS
+from models.linoss import LinOSS, SelectiveLinOSSIM
 from models.selective_lru import SelectiveLRU, SelectiveLRUMIMO
 from models.s4d.s4d import S4DCore
 from models.s5.s5 import S5
@@ -197,6 +197,19 @@ def _build_mixer_cls(d_model, model_cfg, layer_idx=0):
             theta_max=ssm_params.get("theta_max", math.pi),
             a_from_g=ssm_params.get("a_from_g", True),
             use_triton=ssm_params.get("use_triton", False),
+        )
+        mixer_cls = partial(
+            MambaStyleMixer,
+            ssm=ssm,
+            expand=expand,
+            d_conv=d_conv,
+            causal_conv=model_cfg.get("causal_conv", True),
+        )
+    elif ssm == "selective_linoss":
+        ssm = SelectiveLinOSSIM(
+            in_features=expand * d_model,
+            state_dim=d_state,
+            **ssm_params,
         )
         mixer_cls = partial(
             MambaStyleMixer,

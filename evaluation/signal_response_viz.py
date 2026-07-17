@@ -484,6 +484,7 @@ def main():
             ckpt_order.append(ckpt_name)
             del model
         except Exception as e:
+            raise e
             failures.append((ckpt_name, f"{type(e).__name__}: {e}"))
             print(f"FAILED {ckpt_name}: {type(e).__name__}: {e}")
         finally:

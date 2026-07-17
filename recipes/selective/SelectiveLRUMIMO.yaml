@@ -10,31 +10,31 @@ model_cfg:
     causal_conv: true
     ssm: selective_lru_mimo
     ssm_params:
-      n_heads: 1
+      n_heads: 2
       rank: 1
-      r_min: 0.9
-      theta_max: 3.141592653589793
-      use_triton: true
+      theta_max: 0.8
+      n_real_modes: 16  # per head
+      envelope_readout: False
+      mode_detune: False
+      rate_scale: 1.0
       selective_init_std: 0.01
-      normalize_input: true
-      phase_mode: selective  # "selective" | "learnable" | "fixed"
-      phase_value: 0.0  # radians; only used when phase_mode == "fixed"
-      compile_surround: true  # torch.compile the pre/post-scan surround (speeds fwd; adds warmup)
+      use_triton: true
+      input_gain: "zoh"
+
   freq_mixer:
-    d_state: 48
+    d_state: 64
     d_conv: 4
     expand: 2
     norm_epsilon: 1.0e-05
     causal_conv: false
     ssm: selective_lru_mimo
     ssm_params:
-      n_heads: 1
-      rank: 0
-      r_min: 0.9
-      theta_max: 3.141592653589793
-      use_triton: true
+      n_heads: 2
+      rank: 1
+      n_real_modes: 16
+      envelope_readout: False
+      mode_detune: False
+      rate_scale: 1.0
       selective_init_std: 0.01
-      normalize_input: true
-      phase_mode: selective
-      phase_value: 0.0
-      compile_surround: true
+      use_triton: true
+      input_gain: "zoh"

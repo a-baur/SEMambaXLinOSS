@@ -125,11 +125,19 @@ class TFActivationCapture:
 
         def forward(x):
             b, c, t, f = x.size()
+
             x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
-            x = block.tlinear(block.time_mamba(x)) + x
-            after_time = x.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()  # [B,C,T,F]
-            x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
-            x = block.flinear(block.freq_mamba(x)) + x
+            if block.use_transpose:
+                x = block.tlinear(block.time_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+                after_time = x.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()  # [B,C,T,F]
+                x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+                x = block.flinear(block.freq_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
+            else:
+                x = block.tlinear(block.time_mamba(x)) + x
+                after_time = x.view(b, f, t, c).permute(0, 3, 2, 1).contiguous()  # [B,C,T,F]
+                x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+                x = block.flinear(block.freq_mamba(x)) + x
+
             after_freq = x.view(b, t, f, c).permute(0, 3, 1, 2).contiguous()  # [B,C,T,F]
             records.append((after_time.detach().cpu(), after_freq.detach().cpu()))
             return after_freq

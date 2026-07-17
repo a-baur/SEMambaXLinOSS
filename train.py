@@ -220,22 +220,6 @@ def create_partitioned_optimizer(
                 if param is not None and param.requires_grad:
                     ssm_params.append(param)
                     ssm_param_ids.add(id(param))
-        elif isinstance(module, SelectiveLRUMIMO):
-            # Recurrence (pole) parameters get the reduced ssm_lr with no weight
-            # decay — the analog of LinOSS's A_diag/G_diag. Only the baseline-bank
-            # *biases* qualify (magnitude nu_proj.bias, and the phase baseline:
-            # theta_proj.bias in selective mode, or the learnable theta parameter);
-            # the selective *weight* matrices nu_proj.weight/theta_proj.weight stay
-            # at the base LR so they can learn the input-dependence fast enough.
-            recurrence_params = [module.nu_proj.bias]
-            if module.phase_mode == "selective":
-                recurrence_params.append(module.theta_proj.bias)
-            elif module.phase_mode == "learnable":
-                recurrence_params.append(module.theta)
-            for param in recurrence_params:
-                if param is not None and param.requires_grad:
-                    ssm_params.append(param)
-                    ssm_param_ids.add(id(param))
 
     for param in model.parameters():
         if param.requires_grad and id(param) not in ssm_param_ids:

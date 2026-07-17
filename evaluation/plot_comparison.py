@@ -15,6 +15,16 @@ utterances, the comparison is paired -- the plots lean on that:
   * ``significance_heatmap.png`` -- metric x model grid of win-rate over the
     baseline, annotated with the mean delta and significance stars.
 
+When the runs carry SNR-stratification fields (``snr``/``snr_category`` per
+utterance, written by ``evaluate.py --snr_json``), two more figures break the
+results down by input-SNR band:
+
+  * ``snr_stratified.png`` -- grouped bars of each model's per-band mean, one
+    panel per metric, with whiskers spanning the 5th--95th percentile of the
+    per-utterance values in each cell.
+  * ``snr_trends.png`` -- the same per-band means as one line per model, making
+    each model's slope across the SNR range easy to read.
+
 The metric set, labels, and directions are read from each run's
 ``metrics.json`` (the ``metrics_meta`` block ``evaluate.py`` embeds), so adding
 a metric to the evaluator surfaces here automatically -- no edit needed.
@@ -38,6 +48,9 @@ import pandas as pd
 
 # Fallback direction for runs predating the embedded metrics_meta block.
 _FALLBACK_LOWER_IS_BETTER = {"mrstft", "lsd"}
+
+# Per-utterance row keys that are not metrics (path refs + SNR stratification fields).
+_NON_METRIC_KEYS = {"noisy", "clean", "snr", "snr_category"}
 
 
 @dataclass(frozen=True)
@@ -65,7 +78,7 @@ def metrics_from_json(data: dict) -> list[Metric]:
     if meta:
         return [Metric(m["name"], m["label"], bool(m["lower_is_better"])) for m in meta]
     # Older runs: infer names from the per-utterance keys, guess label/direction.
-    keys = [k for k in data["per_utterance"][0] if k not in ("noisy", "clean")]
+    keys = [k for k in data["per_utterance"][0] if k not in _NON_METRIC_KEYS]
     return [Metric(k, k.upper(), k in _FALLBACK_LOWER_IS_BETTER) for k in keys]
 
 
@@ -83,12 +96,16 @@ def stars(p) -> str:
 
 
 def discover_models(comparison_dir: str):
-    """Return ``(models, metrics)``.
+    """Return ``(models, metrics, snr)``.
 
     ``models`` is ``{model_name: {metric: {utt_key: value}}}``; ``metrics`` is the
     list of :class:`Metric` discovered from the first run's ``metrics.json``.
+    ``snr`` is ``{"cat_by_utt": {utt: category}, "snr_by_utt": {utt: dB},
+    "cat_order": [...]}`` gathered from the SNR-stratification fields (empty dicts
+    / ``None`` for runs that predate stratification).
     """
     models, metrics = {}, None
+    cat_by_utt, snr_by_utt, cat_order = {}, {}, None
     for name in sorted(os.listdir(comparison_dir)):
         mpath = os.path.join(comparison_dir, name, "metrics.json")
         if not os.path.isfile(mpath):
@@ -97,12 +114,22 @@ def discover_models(comparison_dir: str):
             data = json.load(f)
         if metrics is None:
             metrics = metrics_from_json(data)
+        # per_snr keys are already emitted in ascending-SNR order by evaluate.py.
+        if cat_order is None:
+            per_snr = data.get("summary", {}).get("per_snr")
+            if per_snr:
+                cat_order = list(per_snr.keys())
         by_metric = {m.name: {} for m in metrics}
         for row in data["per_utterance"]:
             for m in metrics:
                 by_metric[m.name][row["noisy"]] = row.get(m.name)
+            if row.get("snr_category") is not None:
+                cat_by_utt[row["noisy"]] = row["snr_category"]
+            if row.get("snr") is not None:
+                snr_by_utt[row["noisy"]] = row["snr"]
         models[name] = by_metric
-    return models, (metrics or [])
+    snr = {"cat_by_utt": cat_by_utt, "snr_by_utt": snr_by_utt, "cat_order": cat_order}
+    return models, (metrics or []), snr
 
 
 def aligned_frame(models: dict, metrics: list) -> pd.DataFrame:
@@ -123,6 +150,27 @@ def aligned_frame(models: dict, metrics: list) -> pd.DataFrame:
                 if v is not None and not (isinstance(v, float) and math.isnan(v)):
                     records.append((k, name, m.name, v))
     return pd.DataFrame(records, columns=["utt", "model", "metric", "value"])
+
+
+def resolve_cat_order(snr: dict) -> list:
+    """Ordered SNR-category labels (ascending SNR, ``unknown`` last).
+
+    Uses the order embedded by ``evaluate.py`` when available; otherwise ranks the
+    observed categories by their mean numeric SNR.
+    """
+    order = snr.get("cat_order")
+    cats = set(snr["cat_by_utt"].values())
+    if order:
+        # Keep only categories that actually appear, preserving the embedded order.
+        ordered = [c for c in order if c in cats]
+        ordered += [c for c in sorted(cats) if c not in ordered]
+        return ordered
+    snr_by_utt, cat_by_utt = snr["snr_by_utt"], snr["cat_by_utt"]
+    mean_snr = {}
+    for c in cats:
+        vals = [snr_by_utt[u] for u, cc in cat_by_utt.items() if cc == c and u in snr_by_utt]
+        mean_snr[c] = np.mean(vals) if vals else float("inf")
+    return sorted(cats, key=lambda c: (c == "unknown", mean_snr[c]))
 
 
 def load_significance(comparison_dir: str) -> dict:
@@ -264,6 +312,92 @@ def plot_significance_heatmap(df, metrics, order, baseline, sig, out_path):
     plt.close(fig)
 
 
+def _cell_stats(sub, mdl, cat):
+    """(mean, p5, p95) of the per-utterance values in one (model, SNR) cell."""
+    vals = sub[(sub.model == mdl) & (sub.snr_cat == cat)]["value"].to_numpy()
+    if not len(vals):
+        return np.nan, np.nan, np.nan
+    p5, p95 = np.percentile(vals, [5, 95])
+    return float(vals.mean()), float(p5), float(p95)
+
+
+def plot_snr_stratified(df, metrics, order, colors, cats, out_path):
+    """Grouped bars of the per-SNR mean for each model, one panel per metric.
+
+    Bars are the category mean; whiskers span the 5th--95th percentile of the
+    per-utterance values in that (model, SNR) cell -- so the top whisker is the
+    95th-percentile bar.
+    """
+    x = np.arange(len(cats))
+    nmodel = len(order)
+    width = 0.8 / max(nmodel, 1)
+    fig, axes = _panel_axes(metrics)
+    for ax, m in zip(axes, metrics):
+        sub = df[df.metric == m.name]
+        for j, mdl in enumerate(order):
+            means, lo, hi = [], [], []
+            for c in cats:
+                mu, p5, p95 = _cell_stats(sub, mdl, c)
+                means.append(mu)
+                lo.append(mu - p5)
+                hi.append(p95 - mu)
+            pos = x + (j - (nmodel - 1) / 2) * width
+            ax.bar(
+                pos,
+                means,
+                width=width,
+                color=colors[mdl],
+                alpha=0.85,
+                label=mdl,
+                yerr=[lo, hi],
+                capsize=2,
+                error_kw=dict(lw=0.7, alpha=0.5),
+            )
+        ax.set_title(f"{m.label}  ({m.arrow})", fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(cats, rotation=30, ha="right", fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+    for ax in axes[len(metrics) :]:
+        ax.set_visible(False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(order), 6), fontsize=9,
+               frameon=False)
+    fig.suptitle(
+        "Metrics by input-SNR band  (bar = mean, whiskers = 5th--95th percentile)", fontsize=13
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_snr_trends(df, metrics, order, colors, cats, out_path):
+    """Mean metric vs input-SNR band as one line per model (trend across SNR).
+
+    Complements the bar chart: the lines make each model's ranking and its slope
+    across the SNR range easy to read at a glance.
+    """
+    x = np.arange(len(cats))
+    fig, axes = _panel_axes(metrics)
+    for ax, m in zip(axes, metrics):
+        sub = df[df.metric == m.name]
+        for mdl in order:
+            means = [_cell_stats(sub, mdl, c)[0] for c in cats]
+            ax.plot(x, means, marker="o", ms=4, lw=1.6, color=colors[mdl], label=mdl)
+        ax.set_title(f"{m.label}  ({m.arrow})", fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(cats, rotation=30, ha="right", fontsize=8)
+        ax.grid(alpha=0.3)
+    for ax in axes[len(metrics) :]:
+        ax.set_visible(False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(order), 6), fontsize=9,
+               frameon=False)
+    fig.suptitle("Mean metric across input-SNR bands", fontsize=13)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--comparison_dir", default="eval_out/cmp")
@@ -273,12 +407,14 @@ def main():
     parser.add_argument("--output_dir", default=None, help="Default: <comparison_dir>/figures.")
     args = parser.parse_args()
 
-    models, metrics = discover_models(args.comparison_dir)
+    models, metrics, snr = discover_models(args.comparison_dir)
     if len(models) < 2:
         raise SystemExit(f"Need >= 2 models with metrics.json under {args.comparison_dir}")
     if not metrics:
         raise SystemExit("No metrics found in metrics.json files.")
     df = aligned_frame(models, metrics)
+    df["snr_cat"] = df["utt"].map(snr["cat_by_utt"])
+    cats = resolve_cat_order(snr) if snr["cat_by_utt"] else []
     sig = load_significance(args.comparison_dir)
 
     baseline = args.baseline
@@ -309,7 +445,17 @@ def main():
     plot_significance_heatmap(
         df, metrics, order, baseline, sig, os.path.join(out_dir, "significance_heatmap.png")
     )
-    print(f"Wrote 3 figures to {out_dir}")
+    n_figs = 3
+    if cats:
+        print(f"SNR bands: {cats}")
+        plot_snr_stratified(
+            df, metrics, order, colors, cats, os.path.join(out_dir, "snr_stratified.png")
+        )
+        plot_snr_trends(df, metrics, order, colors, cats, os.path.join(out_dir, "snr_trends.png"))
+        n_figs += 2
+    else:
+        print("No SNR stratification fields found; skipping per-SNR figures.")
+    print(f"Wrote {n_figs} figures to {out_dir}")
 
 
 if __name__ == "__main__":
